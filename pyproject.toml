@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nordfox-raskroy"
+dynamic = ["version"]
+description = "Линейный раскрой заготовок NordFox (прототип)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openpyxl>=3.1",
+  "PySide6>=6.5",
+  "reportlab>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+nordfox-raskroy = "nordfox_raskroy.app:run_app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nordfox_raskroy = ["VERSION"]
+
+[tool.setuptools.dynamic]
+version = {file = "src/nordfox_raskroy/VERSION"}
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["src"]
