@@ -58,10 +58,13 @@ def filter_spec_by_profiles(
     for sr in rows:
         d = parse_profile_series_digit(sr.profile_code)
         if d is None:
+            # Нестандартные профили (например L15, DT20 и т.п.) не отбрасываем:
+            # фильтр Н20–Н23 применяется только к распознанным сериям 0..3.
             warnings.append(
-                f"Строка {sr.row_index}: пропуск «{sr.profile_code}» "
-                f"(ожидается СК/СС/Р и цифра 0–3)"
+                f"Строка {sr.row_index}: «{sr.profile_code}» оставлена в расчете "
+                f"(нестандартный код, фильтр Н20–Н23 не применен)"
             )
+            kept.append(sr)
             continue
         if d not in allowed_digits:
             warnings.append(

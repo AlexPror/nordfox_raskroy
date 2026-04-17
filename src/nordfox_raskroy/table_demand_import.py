@@ -13,7 +13,8 @@ def demands_from_cut_table_rows(
     """
     rows: каждая строка — 8 ячеек данных (допускается 9-я «Масса» — игнорируется)
     [Модуль, Тип профиля, Серия, Длина, Угол, Источник, Заготовка, Остаток]
-    Для расчёта используются только: модуль, профиль, длина, угол (серия и пр. игнорируются).
+    Для расчёта: модуль, профиль, длина, угол (серия и пр. игнорируются).
+    Два подреза в ячейке угла: «45/87».
     """
     if not rows:
         return None, "Таблица пуста"
@@ -55,10 +56,23 @@ def demands_from_cut_table_rows(
         except ValueError:
             return None, f"Строка {rnum}: не число в колонке «Длина»: {len_raw!r}"
 
-        try:
-            angle = int(round(float(ang_raw))) if ang_raw else 90
-        except ValueError:
-            return None, f"Строка {rnum}: не число в колонке «Угол»: {ang_raw!r}"
+        cut_angle_2: int | None = None
+        if not ang_raw:
+            angle = 90
+        elif "/" in ang_raw:
+            parts = [p.strip() for p in ang_raw.split("/", 1)]
+            if len(parts) != 2:
+                return None, f"Строка {rnum}: ожидались два угла через «/»: {ang_raw!r}"
+            try:
+                angle = int(round(float(parts[0])))
+                cut_angle_2 = int(round(float(parts[1])))
+            except ValueError:
+                return None, f"Строка {rnum}: не число в колонке «Угол»: {ang_raw!r}"
+        else:
+            try:
+                angle = int(round(float(ang_raw)))
+            except ValueError:
+                return None, f"Строка {rnum}: не число в колонке «Угол»: {ang_raw!r}"
 
         if length_mm <= 0:
             return None, f"Строка {rnum}: длина должна быть > 0"
@@ -71,6 +85,7 @@ def demands_from_cut_table_rows(
                 profile_code=profile,
                 length_mm=length_mm,
                 cut_angle=angle,
+                cut_angle_2=cut_angle_2,
             )
         )
     if not out:

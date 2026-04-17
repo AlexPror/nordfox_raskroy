@@ -47,6 +47,14 @@ class TableDemandImportTests(unittest.TestCase):
         assert d is not None
         self.assertEqual(len(d), 1)
 
+    def test_two_angles_slash(self):
+        r = _row(ang="45/87")
+        d, err = demands_from_cut_table_rows([r], {0, 1, 2, 3})
+        self.assertEqual(err, "")
+        assert d is not None
+        self.assertEqual(d[0].cut_angle, 45)
+        self.assertEqual(d[0].cut_angle_2, 87)
+
 
 if __name__ == "__main__":
     unittest.main()

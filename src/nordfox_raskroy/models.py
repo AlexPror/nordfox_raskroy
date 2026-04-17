@@ -16,6 +16,7 @@ class SpecRow:
     cut_angle: int
     quantity: int
     qr: str | None = None
+    cut_angle_2: int | None = None  # второй подрез (другая сторона), иначе один угол как раньше
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class PartDemand:
     profile_code: str
     length_mm: int
     cut_angle: int
+    cut_angle_2: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,8 @@ class CutEvent:
     stock_source: Literal["new_bar", "scrap"]
     remainder_mm: int
     waste_mm: int
+    #: 0 — обрезок со склада до расчёта; 1+ — N-й открытый пруток и все резы с его хвостов.
+    stock_opening_id: int = 0
 
 
 @dataclass

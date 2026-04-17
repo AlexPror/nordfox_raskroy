@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from nordfox_raskroy.excel_io import parse_specification
 from nordfox_raskroy.optimizer import (
+    format_cut_angles,
     optimize_cutting,
     sort_cuts_for_display,
     spec_rows_to_demands,
@@ -112,7 +113,7 @@ def run_tk_app() -> None:
         "src": "Источник",
         "stock": "Заготовка мм",
         "rem": "Остаток мм",
-        "mass": "Масса, кг",
+        "mass": "Масса профиля, кг",
     }
     for c in cols:
         tree.heading(c, text=headings[c])
@@ -187,7 +188,7 @@ def run_tk_app() -> None:
 
         summary.delete("1.0", tk.END)
         lines = [summarize(result)]
-        lines.append(f"Итого масса деталей, кг: {tot_s if tot_s else '0'}")
+        lines.append(f"Итого масса профиля, кг: {tot_s if tot_s else '0'}")
         if warns:
             lines.append(f"Исключено при фильтре: {len(warns)}")
             lines.append("\n".join(warns[:30]))
@@ -214,7 +215,7 @@ def run_tk_app() -> None:
                     d.profile_code,
                     profile_label_for_code(d.profile_code),
                     d.length_mm,
-                    d.cut_angle,
+                    format_cut_angles(d),
                     "Обрезок" if cut.stock_source == "scrap" else "Новая",
                     cut.stock_length_mm,
                     cut.remainder_mm,

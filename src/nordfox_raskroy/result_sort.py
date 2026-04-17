@@ -9,7 +9,13 @@ from nordfox_raskroy.profile_codes import parse_profile_series_digit
 
 # id для QComboBox.currentData()
 SORT_MODES: list[tuple[str, str]] = [
+    ("opening", "Пруток № (1-й → 2-й → …)"),
+    (
+        "operator",
+        "Оператор: профиль → обрезок → заготовка",
+    ),
     ("module", "Модуль (M1 → …)"),
+    ("module_length_profile", "Модуль → длина → тип профиля"),
     ("profile", "Тип профиля (код)"),
     ("length_desc", "Длина детали ↓"),
     ("length_asc", "Длина детали ↑"),
@@ -40,10 +46,34 @@ def _source_key(source: str) -> int:
 def sort_cuts(cuts: list[CutEvent], mode: str) -> list[CutEvent]:
     """Вернуть новый список в выбранном порядке."""
     base = list(cuts)
-    m = (mode or "module").strip().lower()
+    m = (mode or "opening").strip().lower()
 
+    if m == "opening":
+        return sorted(base, key=lambda c: c.stock_opening_id)
+    if m == "operator":
+        # Меньше переключений: один тип профиля подряд; сначала обрезки со стеллажа,
+        # потом новые прутки; куски одной длины рядом.
+        return sorted(
+            base,
+            key=lambda c: (
+                c.demand.profile_code.upper(),
+                _source_key(c.stock_source),
+                -c.stock_length_mm,
+                _module_key(c.demand.module_name),
+                -c.demand.length_mm,
+            ),
+        )
     if m == "module":
         return sort_cuts_for_display(base, by_module=True)
+    if m == "module_length_profile":
+        return sorted(
+            base,
+            key=lambda c: (
+                _module_key(c.demand.module_name),
+                c.demand.length_mm,
+                c.demand.profile_code.upper(),
+            ),
+        )
     if m == "as_calculated":
         return base
 

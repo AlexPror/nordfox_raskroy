@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from nordfox_raskroy.bar_scenarios import (  # noqa: E402
+    ScenarioOutcome,
     compare_bar_scenarios,
     pick_recommended,
 )
@@ -39,6 +40,24 @@ class BarScenarioTests(unittest.TestCase):
         w1 = pick_recommended(with_scrap)
         assert w0 and w1
         self.assertLessEqual(w1.total_bars, w0.total_bars)
+
+    def test_pick_recommended_mode_waste_first(self):
+        outs = [
+            ScenarioOutcome("A", (6000,), True, "", 10, 60000, 57000, 3000, 5.0, object()),
+            ScenarioOutcome("B", (12000,), True, "", 8, 96000, 83000, 13000, 13.5, object()),
+        ]
+        rec = pick_recommended(outs, mode="waste_first")
+        assert rec is not None
+        self.assertEqual(rec.name, "A")
+
+    def test_pick_recommended_mode_bars_first(self):
+        outs = [
+            ScenarioOutcome("A", (6000,), True, "", 10, 60000, 57000, 3000, 5.0, object()),
+            ScenarioOutcome("B", (12000,), True, "", 8, 96000, 83000, 13000, 13.5, object()),
+        ]
+        rec = pick_recommended(outs, mode="bars_first")
+        assert rec is not None
+        self.assertEqual(rec.name, "B")
 
 
 if __name__ == "__main__":

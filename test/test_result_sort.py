@@ -9,13 +9,21 @@ from nordfox_raskroy.models import CutEvent, PartDemand  # noqa: E402
 from nordfox_raskroy.result_sort import sort_cuts  # noqa: E402
 
 
-def _cut(module: str, profile: str, length: int, src: str = "new_bar", stock: int = 6000) -> CutEvent:
+def _cut(
+    module: str,
+    profile: str,
+    length: int,
+    src: str = "new_bar",
+    stock: int = 6000,
+    opening: int = 0,
+) -> CutEvent:
     return CutEvent(
         PartDemand(1, module, profile, length, 90),
         stock,
         src,  # type: ignore[arg-type]
         100,
         0,
+        stock_opening_id=opening,
     )
 
 
@@ -45,6 +53,26 @@ class ResultSortTests(unittest.TestCase):
         ]
         out = sort_cuts(cuts, "source")
         self.assertEqual(out[0].stock_source, "scrap")
+
+    def test_operator_profile_then_scrap_then_stock_length(self):
+        cuts = [
+            _cut("Модуль M2", "ZZ", 100, "new_bar", 6000, opening=2),
+            _cut("Модуль M1", "AA", 200, "new_bar", 6000, opening=1),
+            _cut("Модуль M1", "AA", 150, "scrap", 800, opening=1),
+        ]
+        out = sort_cuts(cuts, "operator")
+        profiles = [c.demand.profile_code for c in out]
+        self.assertEqual(profiles, ["AA", "AA", "ZZ"])
+        self.assertEqual(out[0].stock_source, "scrap")
+        self.assertEqual(out[1].stock_source, "new_bar")
+
+    def test_opening_sort_by_stock_opening_id(self):
+        cuts = [
+            _cut("M", "P", 100, opening=2),
+            _cut("M", "P", 200, opening=1),
+        ]
+        out = sort_cuts(cuts, "opening")
+        self.assertEqual([c.stock_opening_id for c in out], [1, 2])
 
 
 if __name__ == "__main__":

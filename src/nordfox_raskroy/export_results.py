@@ -16,7 +16,12 @@ from nordfox_raskroy.module_colors import (
     rgb_to_pdf_hex,
 )
 from nordfox_raskroy.materials_library import row_mass_kg_display
+from nordfox_raskroy.optimizer import format_cut_angles
 from nordfox_raskroy.profile_codes import profile_label_for_code
+
+
+def _opening_label(cut: CutEvent) -> str:
+    return "склад" if cut.stock_opening_id == 0 else str(cut.stock_opening_id)
 
 
 def _cut_rows(cuts: list[CutEvent]) -> list[tuple[str, ...]]:
@@ -26,11 +31,12 @@ def _cut_rows(cuts: list[CutEvent]) -> list[tuple[str, ...]]:
         _, mtxt = row_mass_kg_display(d.profile_code, float(d.length_mm), 1.0)
         rows.append(
             (
+                _opening_label(cut),
                 d.module_name,
                 d.profile_code,
                 profile_label_for_code(d.profile_code),
                 str(d.length_mm),
-                str(d.cut_angle),
+                format_cut_angles(d),
                 "Обрезок" if cut.stock_source == "scrap" else "Новая",
                 str(cut.stock_length_mm),
                 str(cut.remainder_mm),
@@ -70,6 +76,7 @@ def export_cuts_excel(
     ws.title = "Раскрой"
 
     headers = (
+        "Пруток №",
         "Модуль",
         "Тип профиля",
         "Серия",
@@ -78,7 +85,7 @@ def export_cuts_excel(
         "Источник",
         "Заготовка мм",
         "Остаток мм",
-        "Масса, кг",
+        "Масса профиля, кг",
     )
     for col, h in enumerate(headers, start=1):
         cell = ws.cell(1, col, h)
@@ -97,11 +104,12 @@ def export_cuts_excel(
         )
         _, mtxt = row_mass_kg_display(d.profile_code, float(d.length_mm), 1.0)
         vals = (
+            _opening_label(cut),
             d.module_name,
             d.profile_code,
             profile_label_for_code(d.profile_code),
             str(d.length_mm),
-            str(d.cut_angle),
+            format_cut_angles(d),
             "Обрезок" if cut.stock_source == "scrap" else "Новая",
             str(cut.stock_length_mm),
             str(cut.remainder_mm),
@@ -115,12 +123,12 @@ def export_cuts_excel(
     if cuts:
         tot_txt, tot_ok = _total_mass_footer(cuts)
         r_tot = len(cuts) + 2
-        ws.merge_cells(start_row=r_tot, start_column=1, end_row=r_tot, end_column=8)
-        c0 = ws.cell(r_tot, 1, "Итого, кг")
+        ws.merge_cells(start_row=r_tot, start_column=1, end_row=r_tot, end_column=9)
+        c0 = ws.cell(r_tot, 1, "Итого масса профиля, кг")
         c0.font = Font(bold=True)
         c0.alignment = Alignment(horizontal="right", vertical="center")
         c0.fill = PatternFill(patternType="solid", fgColor="FFE2E8F0")
-        ct = ws.cell(r_tot, 9, tot_txt if tot_ok else "—")
+        ct = ws.cell(r_tot, 10, tot_txt if tot_ok else "—")
         ct.font = Font(bold=True)
         ct.alignment = Alignment(vertical="center")
         ct.fill = PatternFill(patternType="solid", fgColor="FFE2E8F0")
@@ -188,6 +196,7 @@ def export_cuts_pdf(
         story.append(Spacer(1, 6 * mm))
 
     headers = [
+        "Пруток",
         "Модуль",
         "Профиль",
         "Серия",
@@ -196,7 +205,7 @@ def export_cuts_pdf(
         "Источник",
         "Загот. мм",
         "Остаток",
-        "Масса, кг",
+        "Масса профиля, кг",
     ]
     data: list[list[str]] = [headers]
     for cut in cuts:
@@ -205,7 +214,8 @@ def export_cuts_pdf(
         tot_txt, tot_ok = _total_mass_footer(cuts)
         data.append(
             [
-                "Итого, кг",
+                "Итого масса профиля, кг",
+                "",
                 "",
                 "",
                 "",
@@ -218,14 +228,15 @@ def export_cuts_pdf(
         )
 
     col_widths = [
+        12 * mm,
+        24 * mm,
         26 * mm,
-        28 * mm,
         12 * mm,
         12 * mm,
         10 * mm,
-        16 * mm,
-        16 * mm,
-        16 * mm,
+        14 * mm,
+        14 * mm,
+        14 * mm,
         14 * mm,
     ]
     t = Table(data, colWidths=col_widths, repeatRows=1)

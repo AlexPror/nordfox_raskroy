@@ -39,6 +39,17 @@ class ProfileCodesTests(unittest.TestCase):
         self.assertEqual(kept[0].profile_code, "СК-0-100")
         self.assertTrue(any("не включён" in x for x in w))
 
+    def test_filter_keeps_unknown_profile_codes(self):
+        rows = [
+            SpecRow(2, 1, "M", "L15", 1000, 90, 1, None),
+            SpecRow(3, 1, "M", "DT20", 1200, 45, 1, None),
+        ]
+        kept, w = filter_spec_by_profiles(rows, {0, 1, 2, 3})
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(kept[0].profile_code, "L15")
+        self.assertEqual(kept[1].profile_code, "DT20")
+        self.assertTrue(any("оставлена в расчете" in x for x in w))
+
 
 if __name__ == "__main__":
     unittest.main()
