@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 import logging
-import math
 from pathlib import Path
 import re
 
@@ -12,6 +11,7 @@ try:
     from PySide6.QtCore import QObject, QEvent, QPointF, QRectF, Qt, Signal
     from PySide6.QtGui import (
         QAction,
+        QBrush,
         QColor,
         QFont,
         QFontMetrics,
@@ -19,6 +19,7 @@ try:
         QPainter,
         QPen,
         QPolygonF,
+        QRegion,
         QShortcut,
     )
     from PySide6.QtWidgets import (
@@ -36,6 +37,7 @@ try:
         QMainWindow,
         QMenu,
         QMessageBox,
+        QInputDialog,
         QPushButton,
         QPlainTextEdit,
         QScrollArea,
@@ -84,6 +86,75 @@ from nordfox_raskroy.scrap_stock_io import parse_scrap_inventory
 from nordfox_raskroy import __version__
 from nordfox_raskroy.table_demand_import import demands_from_cut_table_rows
 logger = logging.getLogger("nordfox_raskroy.qt_app")
+
+# Техзона и пропил на схеме — отдельные цвета; углы только подписью, без линий на профиле.
+_TECH_VIS_FILL = QColor(255, 237, 213)
+_TECH_VIS_LINE = QColor(234, 88, 12)
+_KERF_VIS_FILL = QColor(207, 250, 254)
+_KERF_VIS_LINE = QColor(14, 116, 144)
+
+
+def _reportlab_cyrillic_fonts() -> tuple[str, str]:
+    """Имена шрифтов ReportLab с поддержкой кириллицы; иначе Helvetica (без кириллицы)."""
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return "Helvetica", "Helvetica-Bold"
+    if "NF-Regular" in pdfmetrics.getRegisteredFontNames():
+        return "NF-Regular", "NF-Bold"
+    candidates = [
+        (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\arialbd.ttf")),
+        (Path(r"C:\Windows\Fonts\DejaVuSans.ttf"), Path(r"C:\Windows\Fonts\DejaVuSans-Bold.ttf")),
+        (
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ),
+    ]
+    for reg_path, bold_path in candidates:
+        if reg_path.is_file() and bold_path.is_file():
+            try:
+                pdfmetrics.registerFont(TTFont("NF-Regular", str(reg_path)))
+                pdfmetrics.registerFont(TTFont("NF-Bold", str(bold_path)))
+                return "NF-Regular", "NF-Bold"
+            except Exception:  # noqa: BLE001
+                logger.exception("reportlab TTF register failed: %s", reg_path)
+    return "Helvetica", "Helvetica-Bold"
+
+
+def _paint_diagonal_hatch(
+    painter: QPainter,
+    polygon: QPolygonF,
+    *,
+    fill: QColor,
+    line_color: QColor,
+    spacing: float,
+    line_width: float,
+    cross: bool = False,
+) -> None:
+    """Заливка + явные диагонали в клипе полигона (читаемо, как в CAD)."""
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(fill)
+    painter.drawPolygon(polygon)
+    br = polygon.boundingRect()
+    if br.width() < 0.5 or br.height() < 0.5:
+        return
+    painter.save()
+    painter.setClipRegion(QRegion(polygon.toPolygon()))
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QPen(line_color, line_width))
+    h = max(br.height(), 1.0)
+    x = br.left() - h
+    while x < br.right() + spacing:
+        painter.drawLine(QPointF(x, br.bottom()), QPointF(x + h, br.top()))
+        x += spacing
+    if cross:
+        painter.setPen(QPen(line_color, max(0.6, line_width * 0.75)))
+        x2 = br.left() - h + spacing * 0.5
+        while x2 < br.right() + spacing:
+            painter.drawLine(QPointF(x2, br.top()), QPointF(x2 + h, br.bottom()))
+            x2 += spacing * 2.0
+    painter.restore()
 
 
 def _fmt_kg_trim(v: float) -> str:
@@ -239,8 +310,6 @@ class RingBreakdownWidget(QWidget):
 class CuttingLayoutWidget(QWidget):
     """Визуальная схема раскроя по пруткам (прямоугольники с сегментами)."""
 
-    _TECH_COLOR = QColor(251, 191, 36)
-    _KERF_COLOR = QColor(148, 163, 184)
     overflowLegendChanged = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -255,8 +324,8 @@ class CuttingLayoutWidget(QWidget):
     def set_plan(self, rows: list[dict[str, object]], color_map: dict[str, QColor]) -> None:
         self._rows = rows
         self._color_map = color_map
-        row_h = int(40 * self._zoom)
-        self.setMinimumHeight(max(240, 40 + len(rows) * row_h))
+        row_h = int(52 * self._zoom)
+        self.setMinimumHeight(max(240, 48 + len(rows) * row_h))
         self._rebuild_overflow_index()
         self.update()
 
@@ -270,8 +339,8 @@ class CuttingLayoutWidget(QWidget):
 
     def set_zoom(self, zoom: float) -> None:
         self._zoom = max(1.0, min(2.0, float(zoom)))
-        row_h = int(40 * self._zoom)
-        self.setMinimumHeight(max(240, 40 + len(self._rows) * row_h))
+        row_h = int(52 * self._zoom)
+        self.setMinimumHeight(max(240, 48 + len(self._rows) * row_h))
         self._rebuild_overflow_index()
         self.update()
 
@@ -283,8 +352,8 @@ class CuttingLayoutWidget(QWidget):
         z = self._zoom
         xw = max(400.0, float(self.width() - 180))
         bar_h = 22.0 * z
-        min_font = 5
-        max_font = max(7, int(round(7 * z)))
+        min_font = 4
+        max_font = max(6, int(round(6 * z)))
         entries: list[dict[str, object]] = []
         idx_by_key: dict[tuple[int, int], int] = {}
         for row in self._rows:
@@ -309,7 +378,7 @@ class CuttingLayoutWidget(QWidget):
                 right_angle = str(seg.get("right_angle", ""))
                 fit_label = f"{label} L{left_angle} R{right_angle}".strip()
                 full_fits = False
-                if sw >= 18:
+                if sw >= 14:
                     max_w = max(8.0, sw - 4.0)
                     max_h = max(8.0, bar_h - 4.0)
                     for s in range(max_font, min_font - 1, -1):
@@ -318,7 +387,7 @@ class CuttingLayoutWidget(QWidget):
                         if m.horizontalAdvance(fit_label) <= max_w and m.height() <= max_h:
                             full_fits = True
                             break
-                if (sw < 18) or (not full_fits):
+                if (sw < 14) or (not full_fits):
                     key = (opening, profile_idx)
                     idx = len(entries) + 1
                     idx_by_key[key] = idx
@@ -347,7 +416,7 @@ class CuttingLayoutWidget(QWidget):
         p.fillRect(self.rect(), QColor(248, 250, 252))
         z = self._zoom
         p.setPen(QColor(51, 65, 85))
-        p.setFont(QFont("Segoe UI", max(8, int(round(9 * z)))))
+        p.setFont(QFont("Segoe UI", max(7, int(round(8 * z)))))
 
         if not self._rows:
             p.drawText(16, 28, "Нет данных для схемы раскроя")
@@ -357,6 +426,9 @@ class CuttingLayoutWidget(QWidget):
         xw = max(400.0, float(self.width() - 180))
         y = 20.0
         bar_h = 22.0 * z
+        row_gap_above_bar = 14.0 * z
+        row_gap_below_bar = 16.0 * z
+        tech_label_h = 11.0 * z
         for row in self._rows:
             opening = int(row.get("opening", 0))
             bar_len = int(row.get("bar_len", 0))
@@ -365,12 +437,14 @@ class CuttingLayoutWidget(QWidget):
             if not isinstance(segs, list) or bar_len <= 0:
                 continue
 
+            bar_y = y + row_gap_above_bar
+
             p.setPen(QColor(30, 41, 59))
-            p.drawText(12, int(y + 12 * z), f"Пруток {opening} ({bar_len} мм)")
+            p.drawText(12, int(y + 10 * z), f"Пруток {opening} ({bar_len} мм)")
             oc = opening_row_color(opening)
             p.setPen(Qt.NoPen)
             p.setBrush(oc)
-            p.drawRect(QRectF(8, y + 1, 3, bar_h - 2))
+            p.drawRect(QRectF(8, bar_y + 1, 3, bar_h - 2))
             scrap_marks = {
                 str(seg.get("origin", ""))
                 for seg in segs
@@ -378,12 +452,12 @@ class CuttingLayoutWidget(QWidget):
             }
             if scrap_marks:
                 p.setPen(QColor(71, 85, 105))
-                p.setFont(QFont("Segoe UI", max(6, int(round(7 * z)))))
-                p.drawText(12, int(y + 23 * z), "Обрезки: " + ", ".join(sorted(scrap_marks)))
+                p.setFont(QFont("Segoe UI", max(5, int(round(6 * z)))))
+                p.drawText(12, int(bar_y + bar_h + 4 * z), "Обрезки: " + ", ".join(sorted(scrap_marks)))
 
             p.setPen(QPen(QColor(148, 163, 184), 1.0))
             p.setBrush(QColor(255, 255, 255))
-            p.drawRect(QRectF(x0, y, xw, bar_h))
+            p.drawRect(QRectF(x0, bar_y, xw, bar_h))
 
             cursor_mm = 0.0
             profile_idx = 0
@@ -399,63 +473,73 @@ class CuttingLayoutWidget(QWidget):
                     profile_name = str(seg.get("profile_name", ""))
                     color = self._color_map.get(profile_name, QColor(96, 165, 250))
                 elif kind == "tech":
-                    color = self._TECH_COLOR
+                    color = _TECH_VIS_FILL
                 else:
-                    color = self._KERF_COLOR
+                    color = QColor(255, 255, 255)
 
                 sx = x0 + xw * (cursor_mm / bar_len)
                 sw = xw * (length_mm / bar_len)
                 p.setPen(QPen(QColor(255, 255, 255), 0.8))
                 p.setBrush(color)
                 if kind == "tech":
-                    angle = int(seg.get("angle", 90))
-                    p.drawRect(QRectF(sx, y, sw, bar_h))
-                    if sw >= 4:
-                        theta = math.radians(max(1.0, min(179.0, float(angle))))
-                        tan_theta = math.tan(theta)
-                        dx_per_h = 0.0 if abs(tan_theta) <= 1e-9 else bar_h / tan_theta
-                        cut_x_top = max(sx, min(sx + sw, sx + dx_per_h))
-                        half_band = max(2.0 * z, min(sw * 0.28, 8.0 * z))
-                        x_top_l = max(sx, min(sx + sw, cut_x_top - half_band))
-                        x_top_r = max(sx, min(sx + sw, cut_x_top + half_band))
-                        cut_poly = QPolygonF(
-                            [
-                                QPointF(sx, y + bar_h),
-                                QPointF(sx + sw, y + bar_h),
-                                QPointF(x_top_r, y),
-                                QPointF(x_top_l, y),
-                            ]
-                        )
-                        p.setPen(QPen(QColor(71, 85, 105), 1.0))
-                        p.setBrush(QColor(245, 158, 11, 140))
-                        p.drawPolygon(cut_poly)
-                        p.setPen(QPen(QColor(71, 85, 105), max(1.0, 1.2 * z)))
-                        p.drawLine(QPointF(cut_x_top, y), QPointF(sx, y + bar_h))
+                    tech_show = int(seg.get("tech_mm", length_mm))
+                    tech_rect = QRectF(sx, bar_y, sw, bar_h)
+                    tech_poly = QPolygonF(tech_rect)
+                    _paint_diagonal_hatch(
+                        p,
+                        tech_poly,
+                        fill=_TECH_VIS_FILL,
+                        line_color=_TECH_VIS_LINE,
+                        spacing=max(3.0 * z, sw / 10.0),
+                        line_width=max(0.8, 1.0 * z),
+                        cross=True,
+                    )
+                    p.setPen(QPen(_TECH_VIS_LINE, 1.0))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawRect(tech_rect)
+                    p.setPen(_TECH_VIS_LINE)
+                    p.setFont(QFont("Segoe UI", max(6, int(round(7 * z))), QFont.Bold))
+                    p.drawText(
+                        QRectF(sx, bar_y - tech_label_h - 1, sw, tech_label_h),
+                        int(Qt.AlignHCenter | Qt.AlignBottom),
+                        f"{tech_show}",
+                    )
                 elif kind == "kerf":
-                    side = str(seg.get("side", ""))
-                    angle = int(seg.get("angle", 90))
-                    if sw >= 2.0:
-                        theta = math.radians(max(1.0, min(179.0, float(angle))))
-                        tan_theta = math.tan(theta)
-                        dx_per_h = 0.0 if abs(tan_theta) <= 1e-9 else bar_h / tan_theta
-                        if side == "right":
-                            x_ref = sx + sw
-                            cut_x_top = max(sx, min(sx + sw, x_ref - dx_per_h))
-                            p.setPen(QPen(QColor(71, 85, 105), max(1.0, 1.1 * z)))
-                            p.drawLine(QPointF(cut_x_top, y), QPointF(x_ref, y + bar_h))
-                        else:
-                            cut_x_top = max(sx, min(sx + sw, sx + dx_per_h))
-                            p.setPen(QPen(QColor(71, 85, 105), max(1.0, 1.1 * z)))
-                            p.drawLine(QPointF(cut_x_top, y), QPointF(sx, y + bar_h))
+                    if sw >= 1.0:
+                        kerf_rect = QRectF(sx, bar_y, sw, bar_h)
+                        kerf_poly = QPolygonF(kerf_rect)
+                        _paint_diagonal_hatch(
+                            p,
+                            kerf_poly,
+                            fill=_KERF_VIS_FILL,
+                            line_color=_KERF_VIS_LINE,
+                            spacing=max(2.5 * z, sw / 5.0),
+                            line_width=max(0.85, 1.0 * z),
+                            cross=True,
+                        )
+                        p.setPen(QPen(_KERF_VIS_LINE, 1.0))
+                        p.setBrush(Qt.NoBrush)
+                        p.drawRect(kerf_rect)
+                        p.setPen(QPen(_KERF_VIS_LINE, 1.25))
+                        p.drawLine(QPointF(sx, bar_y + bar_h), QPointF(sx, bar_y))
+                        p.drawLine(QPointF(sx + sw, bar_y + bar_h), QPointF(sx + sw, bar_y))
+                        if sw >= 6:
+                            p.setPen(_KERF_VIS_LINE.darker(120))
+                            p.setFont(QFont("Segoe UI", max(4, int(round(5 * z))), QFont.Bold))
+                            p.drawText(
+                                QRectF(sx + 1, bar_y + 1, sw - 2, bar_h - 2),
+                                int(Qt.AlignCenter),
+                                str(int(seg.get("kerf_mm", 4))),
+                            )
                 else:
-                    p.drawRect(QRectF(sx, y, sw, bar_h))
-                if kind == "profile" and sw >= 18:
+                    p.drawRect(QRectF(sx, bar_y, sw, bar_h))
+                if kind == "profile" and sw >= 14:
                     p.setPen(QColor(15, 23, 42))
                     max_w = max(8.0, sw - 4.0)
                     max_h = max(8.0, bar_h - 4.0)
                     chosen: QFont | None = None
                     text = label
-                    for s in range(max(7, int(round(7 * z))), 4, -1):
+                    for s in range(max(6, int(round(6 * z))), 3, -1):
                         f = QFont("Segoe UI", s)
                         m = QFontMetrics(f)
                         t = m.elidedText(label, Qt.TextElideMode.ElideRight, int(max_w))
@@ -464,36 +548,49 @@ class CuttingLayoutWidget(QWidget):
                             text = t
                             break
                     if chosen is None:
-                        chosen = QFont("Segoe UI", 5)
+                        chosen = QFont("Segoe UI", 4)
                         text = QFontMetrics(chosen).elidedText(
                             label,
                             Qt.TextElideMode.ElideRight,
                             int(max_w),
                         )
                     p.setFont(chosen)
-                    p.drawText(QRectF(sx + 2, y + 2, sw - 4, bar_h - 4), int(Qt.AlignCenter), text)
+                    p.drawText(QRectF(sx + 2, bar_y + 2, sw - 4, bar_h - 4), int(Qt.AlignCenter), text)
+                    left_a = int(seg.get("left_angle", 90))
+                    right_a = int(seg.get("right_angle", left_a))
                     if sw >= 28:
-                        left_a = int(seg.get("left_angle", 90))
-                        right_a = int(seg.get("right_angle", left_a))
                         p.setPen(QColor(30, 41, 59))
-                        p.setFont(QFont("Segoe UI", max(5, int(round(6 * z)))))
+                        p.setFont(QFont("Segoe UI", max(4, int(round(5 * z)))))
                         p.drawText(
-                            QRectF(sx + 1, y + bar_h - 10 * z, max(sw * 0.48, 8), 9 * z),
+                            QRectF(sx + 1, bar_y + bar_h - 10 * z, max(sw * 0.48, 8), 9 * z),
                             int(Qt.AlignLeft | Qt.AlignVCenter),
                             f"L{left_a}°",
                         )
                         p.drawText(
-                            QRectF(sx + sw * 0.52, y + bar_h - 10 * z, max(sw * 0.46, 8), 9 * z),
+                            QRectF(sx + sw * 0.52, bar_y + bar_h - 10 * z, max(sw * 0.46, 8), 9 * z),
                             int(Qt.AlignRight | Qt.AlignVCenter),
+                            f"R{right_a}°",
+                        )
+                    else:
+                        p.setPen(QColor(51, 65, 85))
+                        p.setFont(QFont("Segoe UI", max(4, int(round(5 * z)))))
+                        p.drawText(
+                            QRectF(sx - 18 * z, bar_y - tech_label_h - 1, 24 * z, tech_label_h),
+                            int(Qt.AlignLeft | Qt.AlignBottom),
+                            f"L{left_a}°",
+                        )
+                        p.drawText(
+                            QRectF(sx + sw - 6 * z, bar_y - tech_label_h - 1, 24 * z, tech_label_h),
+                            int(Qt.AlignRight | Qt.AlignBottom),
                             f"R{right_a}°",
                         )
                 if kind == "profile":
                     oid = self._overflow_index_by_key.get((opening, profile_idx))
                     if oid is not None:
                         p.setPen(QColor(15, 23, 42))
-                        p.setFont(QFont("Segoe UI", max(6, int(round(7 * z))), QFont.Bold))
+                        p.setFont(QFont("Segoe UI", max(5, int(round(6 * z))), QFont.Bold))
                         p.drawText(
-                            QRectF(sx + 1, y + 1, max(sw - 2, 8), bar_h - 2),
+                            QRectF(sx + 1, bar_y + 1, max(sw - 2, 8), bar_h - 2),
                             int(Qt.AlignCenter),
                             f"#{oid}",
                         )
@@ -501,7 +598,7 @@ class CuttingLayoutWidget(QWidget):
                 if kind == "profile" and bool(seg.get("is_scrap")):
                     p.setPen(QColor(100, 116, 139))
                     p.setBrush(Qt.NoBrush)
-                    p.drawRect(QRectF(sx + 0.8, y + 0.8, max(sw - 1.6, 1.0), max(bar_h - 1.6, 1.0)))
+                    p.drawRect(QRectF(sx + 0.8, bar_y + 0.8, max(sw - 1.6, 1.0), max(bar_h - 1.6, 1.0)))
                 cursor_mm += length_mm
 
             if remainder > 0:
@@ -509,11 +606,192 @@ class CuttingLayoutWidget(QWidget):
                 rw = xw * (remainder / bar_len)
                 p.setPen(QPen(QColor(148, 163, 184), 1.0, Qt.PenStyle.DashLine))
                 p.setBrush(Qt.NoBrush)
-                p.drawRect(QRectF(rx, y, rw, bar_h))
+                p.drawRect(QRectF(rx, bar_y, rw, bar_h))
                 p.setPen(QColor(71, 85, 105))
-                p.setFont(QFont("Segoe UI", max(7, int(round(7 * z)))))
-                p.drawText(QRectF(rx + 2, y + 2, max(rw - 4, 12), bar_h - 4), int(Qt.AlignCenter), f"остаток {remainder}")
-            y += 38.0 * z
+                p.setFont(QFont("Segoe UI", max(6, int(round(6 * z)))))
+                p.drawText(
+                    QRectF(rx + 2, bar_y + 2, max(rw - 4, 12), bar_h - 4),
+                    int(Qt.AlignCenter),
+                    f"остаток {remainder}",
+                )
+            y += row_gap_above_bar + bar_h + row_gap_below_bar
+
+
+class JointAlbumWidget(QWidget):
+    """Крупный альбом стыков соседних деталей."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rows: list[dict[str, object]] = []
+        self._color_map: dict[str, QColor] = {}
+        self.setMinimumHeight(280)
+
+    def set_rows(self, rows: list[dict[str, object]], color_map: dict[str, QColor]) -> None:
+        self._rows = rows
+        self._color_map = color_map
+        self.setMinimumHeight(max(280, 24 + len(rows) * 126))
+        self.setMinimumWidth(720)
+        self.updateGeometry()
+        self.update()
+
+    def clear_rows(self) -> None:
+        self._rows = []
+        self.setMinimumHeight(280)
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor(248, 250, 252))
+        if not self._rows:
+            p.setPen(QColor(51, 65, 85))
+            p.setFont(QFont("Segoe UI", 9))
+            p.drawText(14, 28, "Нет данных для альбома стыков")
+            return
+
+        y = 12.0
+        row_h = 116.0
+        left_x = 140.0
+        detail_w = max(180.0, (self.width() - 220.0) / 2.0)
+        detail_h = 56.0
+
+        def _draw_detail(
+            rect: QRectF,
+            fill_color: QColor,
+            title: str,
+            left_angle_deg: int,
+            right_angle_deg: int,
+            tech_mm: int,
+            kerf_mm: int,
+        ) -> None:
+            yt = rect.top()
+            yb = rect.bottom()
+            # Левый техотступ и вертикальный пропил; справа — только пропил (схема 1D).
+            ltw = 16.0 if tech_mm == 50 else 10.0
+            kw = 6.0 if kerf_mm >= 4 else 4.0
+            left_zone_end = rect.left() + ltw + kw
+            right_zone_start = rect.right() - kw
+
+            tech_rect = QRectF(rect.left(), yt, ltw, rect.height())
+            kerf_l = QRectF(rect.left() + ltw, yt, kw, rect.height())
+            kerf_r = QRectF(right_zone_start, yt, rect.right() - right_zone_start, rect.height())
+            body = QRectF(left_zone_end, yt, right_zone_start - left_zone_end, rect.height())
+
+            p.setPen(QPen(QColor(241, 245, 249), 1.0))
+            p.setBrush(fill_color)
+            p.drawRect(rect)
+
+            _paint_diagonal_hatch(
+                p,
+                QPolygonF(tech_rect),
+                fill=_TECH_VIS_FILL,
+                line_color=_TECH_VIS_LINE,
+                spacing=4.0,
+                line_width=1.0,
+                cross=True,
+            )
+            p.setPen(QPen(_TECH_VIS_LINE, 1.0))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(tech_rect)
+            p.setPen(_TECH_VIS_LINE)
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            p.drawText(
+                QRectF(tech_rect.left(), yt - 16, tech_rect.width(), 14),
+                int(Qt.AlignHCenter | Qt.AlignBottom),
+                str(int(tech_mm)),
+            )
+
+            _paint_diagonal_hatch(
+                p,
+                QPolygonF(kerf_l),
+                fill=_KERF_VIS_FILL,
+                line_color=_KERF_VIS_LINE,
+                spacing=max(3.0, kw / 2.0),
+                line_width=1.0,
+                cross=True,
+            )
+            p.setPen(QPen(_KERF_VIS_LINE, 1.0))
+            p.drawRect(kerf_l)
+            p.drawLine(QPointF(kerf_l.left(), yb), QPointF(kerf_l.left(), yt))
+            p.drawLine(QPointF(kerf_l.right(), yb), QPointF(kerf_l.right(), yt))
+            p.setPen(_KERF_VIS_LINE.darker(120))
+            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            p.drawText(kerf_l.adjusted(0, 0, 0, 0), int(Qt.AlignCenter), str(int(kerf_mm)))
+
+            _paint_diagonal_hatch(
+                p,
+                QPolygonF(kerf_r),
+                fill=_KERF_VIS_FILL,
+                line_color=_KERF_VIS_LINE,
+                spacing=max(3.0, kw / 2.0),
+                line_width=1.0,
+                cross=True,
+            )
+            p.setPen(QPen(_KERF_VIS_LINE, 1.0))
+            p.drawRect(kerf_r)
+            p.drawLine(QPointF(kerf_r.left(), yb), QPointF(kerf_r.left(), yt))
+            p.drawLine(QPointF(kerf_r.right(), yb), QPointF(kerf_r.right(), yt))
+            p.setPen(_KERF_VIS_LINE.darker(120))
+            p.drawText(kerf_r, int(Qt.AlignCenter), str(int(kerf_mm)))
+
+            p.setPen(QPen(fill_color.darker(115), 1.0))
+            p.setBrush(fill_color)
+            p.drawRect(body)
+
+            p.setPen(QColor(15, 23, 42))
+            p.setFont(QFont("Segoe UI", 8))
+            fm = QFontMetrics(p.font())
+            p.drawText(
+                body.adjusted(4, 2, -4, -2),
+                int(Qt.AlignCenter),
+                fm.elidedText(title, Qt.TextElideMode.ElideRight, int(body.width() - 8)),
+            )
+
+            p.setPen(QColor(51, 65, 85))
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            p.drawText(int(rect.left() + 2), int(rect.bottom() + 16), f"L: {left_angle_deg}°")
+            p.drawText(int(rect.right() - 56), int(rect.bottom() + 16), f"R: {right_angle_deg}°")
+
+        for r in self._rows:
+            opening = int(r.get("opening", 0))
+            kind = str(r.get("kind", "joint"))
+            left_title = str(r.get("left_title", ""))
+            right_title = str(r.get("right_title", ""))
+            left_profile = str(r.get("left_profile_name", ""))
+            right_profile = str(r.get("right_profile_name", ""))
+            left_angle = int(r.get("left_right_angle", 90))
+            right_angle = int(r.get("right_left_angle", 90))
+            left_left_angle = int(r.get("left_left_angle", left_angle))
+            right_right_angle = int(r.get("right_right_angle", right_angle))
+
+            block = QRectF(8, y, self.width() - 16, row_h)
+            p.setPen(QPen(QColor(203, 213, 225), 1.0))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawRoundedRect(block, 6, 6)
+            p.setPen(QColor(30, 41, 59))
+            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            p.drawText(
+                16,
+                int(y + 18),
+                f"Пруток {opening}: {'стык' if kind == 'joint' else 'деталь'}",
+            )
+
+            ly = y + 36.0
+            left_rect = QRectF(left_x, ly, detail_w, detail_h)
+            seam_x = left_rect.right()
+            right_rect = QRectF(seam_x, ly, detail_w, detail_h)
+            left_tech = int(r.get("left_tech_mm", 30))
+            right_tech = int(r.get("right_tech_mm", 30))
+            kerf_mm = int(r.get("kerf_mm", 4))
+
+            lc = self._color_map.get(left_profile, QColor(147, 197, 253))
+            rc = self._color_map.get(right_profile, QColor(134, 239, 172))
+            _draw_detail(left_rect, lc, left_title, left_left_angle, left_angle, left_tech, kerf_mm)
+            _draw_detail(right_rect, rc, right_title, right_angle, right_right_angle, right_tech, kerf_mm)
+
+            p.setPen(QPen(QColor(15, 23, 42), 1.2, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(seam_x, ly - 3), QPointF(seam_x, ly + detail_h + 3))
+            y += row_h + 10.0
 
 
 class MainWindow(QMainWindow):
@@ -557,6 +835,7 @@ class MainWindow(QMainWindow):
         self._selected_bars_mm: tuple[int, ...] | None = None
         self._last_kerf_mm: int = 0
         self._layout_rows: list[dict[str, object]] = []
+        self._album_rows: list[dict[str, object]] = []
         self._table_zoom = 1.0
         self._layout_zoom = 1.0
         self.log_emitter = LogEmitter()
@@ -808,10 +1087,8 @@ class MainWindow(QMainWindow):
         plan_btns.addWidget(self.btn_layout_pdf)
         plan_btns.addStretch(1)
         self.layout_hint = QLabel(
-            "Сегменты: тех. отступ (жёлтый) + kerf слева/справа (серый) + профиль (цвет серии). "
-            "Пунктир: деталь нарезана из обрезка (источник указан слева). "
-            "Для узких сегментов метки #N вынесены в таблицу ниже. "
-            "Углы детали: L (левый) и R (правый)."
+            "Сегменты: техотступ (оранж.) — мм над полосой; пропил (бирюза), вертикальная полоса; профиль — цвет серии. "
+            "Углы только подписью (L/R). Пунктир: деталь из обрезка. Узкие сегменты — метки #N в таблице ниже."
         )
         self.layout_hint.setStyleSheet("color: #475569;")
         layout_tab_l.addWidget(self.layout_hint)
@@ -839,6 +1116,37 @@ class MainWindow(QMainWindow):
             oh.setSectionResizeMode(i, QHeaderView.Interactive)
         layout_tab_l.addWidget(self.layout_overflow_table)
         self.right_tabs.addTab(layout_tab, "Схема раскроя")
+
+        album_tab = QWidget()
+        album_l = QVBoxLayout(album_tab)
+        album_l.setContentsMargins(4, 4, 4, 4)
+        album_l.setSpacing(6)
+        album_btns = QHBoxLayout()
+        album_l.addLayout(album_btns)
+        album_btns.addWidget(QLabel("Режим:"))
+        self.album_mode_combo = QComboBox()
+        self.album_mode_combo.addItem("Стыки", "joints")
+        self.album_mode_combo.addItem("Детали", "details")
+        self.album_mode_combo.currentIndexChanged.connect(self._refresh_album)
+        album_btns.addWidget(self.album_mode_combo)
+        self.btn_album_pdf = QPushButton("Экспорт альбома PDF…")
+        self.btn_album_pdf.setEnabled(False)
+        self.btn_album_pdf.clicked.connect(self._export_album_pdf)
+        album_btns.addWidget(self.btn_album_pdf)
+        album_btns.addStretch(1)
+        album_hint = QLabel(
+            "Крупный план стыков: каждая строка показывает соседние детали и геометрию углов на общем резе."
+        )
+        album_hint.setStyleSheet("color: #475569;")
+        album_l.addWidget(album_hint)
+        self.album_widget = JointAlbumWidget()
+        self.album_scroll = QScrollArea()
+        # False: иначе высота альбома сжимается до окна и видна только одна строка.
+        self.album_scroll.setWidgetResizable(False)
+        self.album_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.album_scroll.setWidget(self.album_widget)
+        album_l.addWidget(self.album_scroll, 1)
+        self.right_tabs.addTab(album_tab, "Альбом стыков")
         self._copy_shortcut = QShortcut(QKeySequence.Copy, self)
         self._copy_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._copy_shortcut.activated.connect(self._copy_from_focused_widget)
@@ -995,6 +1303,30 @@ class MainWindow(QMainWindow):
         self._layout_zoom = max(1.0, min(2.0, float(zoom)))
         self.layout_widget.set_zoom(self._layout_zoom)
 
+    def _apply_optimization_result(
+        self,
+        *,
+        result: OptimizationResult,
+        kerf_mm: int,
+        chart_metrics: dict[str, object] | None,
+    ) -> None:
+        """
+        Единая точка обновления всех представлений после любого расчёта.
+        Обновляет раскрой, схему, альбом и массовые метрики синхронно.
+        """
+        self._optimizer_cuts = list(result.cuts)
+        self._last_kerf_mm = kerf_mm
+        self.btn_xlsx.setEnabled(True)
+        self.btn_pdf.setEnabled(True)
+        self.btn_recalc.setEnabled(True)
+        self.btn_layout_xlsx.setEnabled(True)
+        self.btn_layout_pdf.setEnabled(True)
+        self.btn_album_pdf.setEnabled(True)
+        self._update_layout_plan(result.cuts, kerf_mm=kerf_mm)
+        self._update_album_plan(result.cuts)
+        self._apply_chart_metrics(chart_metrics)
+        self._apply_sort()
+
     def _populate_layout_overflow_table(self, rows: list[dict[str, object]]) -> None:
         self.layout_overflow_table.setRowCount(0)
         for r in rows:
@@ -1016,6 +1348,13 @@ class MainWindow(QMainWindow):
                 it = QTableWidgetItem(v)
                 it.setBackground(bg)
                 self.layout_overflow_table.setItem(row, c, it)
+
+    def _refresh_album(self) -> None:
+        if not self._optimizer_cuts:
+            self.album_widget.clear_rows()
+            self._album_rows = []
+            return
+        self._update_album_plan(self._optimizer_cuts)
 
     def _browse_scrap(self) -> None:
         base = self.scrap_path_edit.text().strip()
@@ -1290,32 +1629,26 @@ class MainWindow(QMainWindow):
             return
         try:
             from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.pagesizes import A3, A4, landscape
             from reportlab.lib.units import mm
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
             from reportlab.pdfgen import canvas
         except ImportError as e:  # pragma: no cover
             QMessageBox.critical(self, "Экспорт схемы", f"Нужен reportlab: {e}")
             return
-        font_regular = "Helvetica"
-        font_bold = "Helvetica-Bold"
-        font_candidates = [
-            (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\arialbd.ttf")),
-            (Path(r"C:\Windows\Fonts\DejaVuSans.ttf"), Path(r"C:\Windows\Fonts\DejaVuSans-Bold.ttf")),
-        ]
-        for reg_path, bold_path in font_candidates:
-            if reg_path.is_file() and bold_path.is_file():
-                try:
-                    pdfmetrics.registerFont(TTFont("NF-Regular", str(reg_path)))
-                    pdfmetrics.registerFont(TTFont("NF-Bold", str(bold_path)))
-                    font_regular = "NF-Regular"
-                    font_bold = "NF-Bold"
-                    break
-                except Exception:  # noqa: BLE001
-                    logger.exception("PDF font registration failed: %s", reg_path)
-        c = canvas.Canvas(str(Path(p)), pagesize=landscape(A4))
-        pw, ph = landscape(A4)
+        fmt, ok = QInputDialog.getItem(
+            self,
+            "Формат PDF",
+            "Выберите формат:",
+            ["A3 (горизонтально)", "A4 (горизонтально)"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        base_page = A3 if "A3" in fmt else A4
+        font_regular, font_bold = _reportlab_cyrillic_fonts()
+        c = canvas.Canvas(str(Path(p)), pagesize=landscape(base_page))
+        pw, ph = landscape(base_page)
         y = ph - 18 * mm
         c.setFont(font_bold, 11)
         c.drawString(12 * mm, y, "Схема раскроя")
@@ -1337,7 +1670,7 @@ class MainWindow(QMainWindow):
                 c.drawString(12 * mm, y, "Схема раскроя")
                 y -= 10 * mm
             c.setFillColor(colors.black)
-            c.setFont(font_regular, 8)
+            c.setFont(font_regular, 7)
             c.drawString(12 * mm, y + 2 * mm, f"Пруток {opening} ({bar_len} мм)")
             oc = opening_row_color(opening)
             c.setFillColor(colors.Color(oc.red() / 255.0, oc.green() / 255.0, oc.blue() / 255.0))
@@ -1349,7 +1682,7 @@ class MainWindow(QMainWindow):
             }
             if scrap_marks:
                 c.setFillColor(colors.HexColor("#475569"))
-                c.setFont(font_regular, 6)
+                c.setFont(font_regular, 5)
                 c.drawString(12 * mm, y - 1.2 * mm, "Обрезки: " + ", ".join(sorted(scrap_marks)))
             c.setStrokeColor(colors.HexColor("#94a3b8"))
             c.rect(x0, y, w, bar_h, stroke=1, fill=0)
@@ -1369,24 +1702,36 @@ class MainWindow(QMainWindow):
                         profile_name = str(seg.get("profile_name", ""))
                         qc = self._profile_color_map([profile_name]).get(profile_name, QColor(96, 165, 250))
                         c.setFillColor(colors.Color(qc.red() / 255.0, qc.green() / 255.0, qc.blue() / 255.0))
+                        c.rect(sx, y, sw, bar_h, stroke=0, fill=1)
                     elif kind == "tech":
-                        c.setFillColor(colors.HexColor("#fbbf24"))
+                        c.setFillColor(colors.HexColor("#ffedd5"))
+                        c.setStrokeColor(colors.HexColor("#ea580c"))
+                        c.setLineWidth(0.35)
+                        c.rect(sx, y, sw, bar_h, stroke=1, fill=1)
+                        if sw >= 1.5 * mm:
+                            c.setFillColor(colors.HexColor("#c2410c"))
+                            c.setFont(font_bold, 4)
+                            c.drawCentredString(
+                                sx + sw / 2.0,
+                                y + bar_h + 2.2 * mm,
+                                str(int(seg.get("tech_mm", 30))),
+                            )
                     else:
-                        c.setFillColor(colors.HexColor("#94a3b8"))
-                    c.rect(sx, y, sw, bar_h, stroke=0, fill=1)
+                        c.setFillColor(colors.white)
+                        c.rect(sx, y, sw, bar_h, stroke=0, fill=1)
                     if kind == "profile":
                         left_a = int(seg.get("left_angle", 90))
                         right_a = int(seg.get("right_angle", left_a))
-                        draw_label = sw >= 16 * mm
-                        draw_angles = sw >= 22 * mm
+                        draw_label = sw >= 14 * mm
+                        draw_angles = sw >= 18 * mm
                         if draw_label:
                             txt = str(seg.get("label", ""))
                             c.setFillColor(colors.black)
-                            c.setFont(font_regular, 6)
+                            c.setFont(font_regular, 5)
                             c.drawCentredString(sx + sw / 2.0, y + (bar_h / 2.0) - 2, txt)
                         if draw_angles:
                             c.setFillColor(colors.HexColor("#334155"))
-                            c.setFont(font_regular, 5)
+                            c.setFont(font_regular, 4)
                             c.drawString(sx + 0.7 * mm, y + 0.5 * mm, f"L{left_a}°")
                             c.drawRightString(sx + sw - 0.7 * mm, y + 0.5 * mm, f"R{right_a}°")
                         # Если углы не влезли, добавляем деталь в легенду.
@@ -1394,7 +1739,7 @@ class MainWindow(QMainWindow):
                             overflow_idx += 1
                             mark = f"#{overflow_idx}"
                             c.setFillColor(colors.black)
-                            c.setFont(font_bold, 6)
+                            c.setFont(font_bold, 5)
                             c.drawRightString(sx + sw - 0.4 * mm, y + (bar_h / 2.0) - 2, mark)
                             overflow_entries.append(
                                 {
@@ -1411,21 +1756,22 @@ class MainWindow(QMainWindow):
                             )
                     if kind == "profile":
                         profile_idx += 1
-                    if kind == "kerf" and sw >= 1.2 * mm:
-                        side = str(seg.get("side", ""))
-                        ang = int(seg.get("angle", 90))
-                        theta = math.radians(max(1.0, min(179.0, float(ang))))
-                        tan_theta = math.tan(theta)
-                        dx_per_h = 0.0 if abs(tan_theta) <= 1e-9 else bar_h / tan_theta
-                        c.setStrokeColor(colors.HexColor("#475569"))
+                    if kind == "kerf" and sw >= 1.0 * mm:
+                        c.setFillColor(colors.HexColor("#cffafe"))
+                        c.setStrokeColor(colors.HexColor("#0e7490"))
                         c.setLineWidth(0.35)
-                        if side == "right":
-                            x_ref = sx + sw
-                            cut_x_top = max(sx, min(sx + sw, x_ref - dx_per_h))
-                            c.line(cut_x_top, y, x_ref, y + bar_h)
-                        else:
-                            cut_x_top = max(sx, min(sx + sw, sx + dx_per_h))
-                            c.line(cut_x_top, y, sx, y + bar_h)
+                        c.rect(sx, y, sw, bar_h, stroke=1, fill=1)
+                        c.setLineWidth(0.45)
+                        c.line(sx, y, sx, y + bar_h)
+                        c.line(sx + sw, y, sx + sw, y + bar_h)
+                        if sw >= 2.0 * mm:
+                            c.setFillColor(colors.HexColor("#155e75"))
+                            c.setFont(font_regular, 4)
+                            c.drawCentredString(
+                                sx + sw / 2.0,
+                                y + (bar_h / 2.0) - 1,
+                                str(int(seg.get("kerf_mm", 4))),
+                            )
                     pos += seg_len
             if rem > 0:
                 rx = x0 + w * ((bar_len - rem) / bar_len)
@@ -1436,18 +1782,18 @@ class MainWindow(QMainWindow):
                 c.setDash()
                 if rw >= 12 * mm:
                     c.setFillColor(colors.HexColor("#475569"))
-                    c.setFont(font_regular, 6)
+                    c.setFont(font_regular, 5)
                     c.drawCentredString(rx + rw / 2.0, y + (bar_h / 2.0) - 2, f"остаток {rem}")
-            y -= 10 * mm
+            y -= 11.5 * mm
         if overflow_entries:
             if y < 35 * mm:
                 c.showPage()
                 y = ph - 18 * mm
             c.setFillColor(colors.black)
-            c.setFont(font_bold, 9)
+            c.setFont(font_bold, 8)
             c.drawString(12 * mm, y, "Легенда коротких сегментов (#)")
             y -= 6 * mm
-            c.setFont(font_bold, 7)
+            c.setFont(font_bold, 6)
             c.drawString(12 * mm, y, "#")
             c.drawString(20 * mm, y, "Пруток")
             c.drawString(34 * mm, y, "Модуль")
@@ -1457,15 +1803,15 @@ class MainWindow(QMainWindow):
             c.drawString(122 * mm, y, "R")
             c.drawString(136 * mm, y, "Источник")
             y -= 4 * mm
-            c.setFont(font_regular, 7)
+            c.setFont(font_regular, 6)
             for e in overflow_entries:
                 if y < 14 * mm:
                     c.showPage()
                     y = ph - 18 * mm
-                    c.setFont(font_bold, 9)
+                    c.setFont(font_bold, 8)
                     c.drawString(12 * mm, y, "Легенда коротких сегментов (#)")
                     y -= 6 * mm
-                    c.setFont(font_bold, 7)
+                    c.setFont(font_bold, 6)
                     c.drawString(12 * mm, y, "#")
                     c.drawString(20 * mm, y, "Пруток")
                     c.drawString(34 * mm, y, "Модуль")
@@ -1475,7 +1821,7 @@ class MainWindow(QMainWindow):
                     c.drawString(122 * mm, y, "R")
                     c.drawString(136 * mm, y, "Источник")
                     y -= 4 * mm
-                    c.setFont(font_regular, 7)
+                    c.setFont(font_regular, 6)
                 oe = opening_row_color(int(e.get("opening", 0) or 0))
                 c.setFillColor(colors.Color(oe.red() / 255.0, oe.green() / 255.0, oe.blue() / 255.0))
                 c.rect(11.5 * mm, y - 1.2 * mm, (pw - 24 * mm), 4.0 * mm, stroke=0, fill=1)
@@ -1493,6 +1839,137 @@ class MainWindow(QMainWindow):
                 y -= 4 * mm
         c.save()
         QMessageBox.information(self, "Экспорт схемы", f"Сохранено:\n{p}")
+
+    def _export_album_pdf(self) -> None:
+        if not self._album_rows:
+            QMessageBox.information(self, "Экспорт альбома", "Сначала выполните расчёт.")
+            return
+        default = Path(self.path_edit.text() or "layout").with_name("raskroy_album_a4.pdf")
+        p, _ = QFileDialog.getSaveFileName(self, "Сохранить PDF-альбом", str(default), "PDF (*.pdf)")
+        if not p:
+            return
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            from reportlab.pdfgen import canvas
+        except ImportError as e:  # pragma: no cover
+            QMessageBox.critical(self, "Экспорт альбома", f"Нужен reportlab: {e}")
+            return
+        font_regular, font_bold = _reportlab_cyrillic_fonts()
+        c = canvas.Canvas(str(Path(p)), pagesize=A4)
+        pw, ph = A4
+        y = ph - 16 * mm
+        c.setFont(font_bold, 11)
+        c.drawString(12 * mm, y, "Альбом стыков (A4, вертикально)")
+        y -= 8 * mm
+        left_x = 38 * mm
+        detail_w = (pw - 2 * left_x) / 2
+        detail_h = 18 * mm
+        for r in self._album_rows:
+            if y < 34 * mm:
+                c.showPage()
+                y = ph - 16 * mm
+                c.setFont(font_bold, 11)
+                c.drawString(12 * mm, y, "Альбом стыков (A4, вертикально)")
+                y -= 8 * mm
+            opening = int(r.get("opening", 0))
+            kind = str(r.get("kind", "joint"))
+            left_title = str(r.get("left_title", ""))
+            right_title = str(r.get("right_title", ""))
+            left_angle = int(r.get("left_right_angle", 90))
+            right_angle = int(r.get("right_left_angle", 90))
+            left_left_angle = int(r.get("left_left_angle", left_angle))
+            right_right_angle = int(r.get("right_right_angle", right_angle))
+            left_tech = int(r.get("left_tech_mm", 30))
+            right_tech = int(r.get("right_tech_mm", 30))
+            kerf_mm = int(r.get("kerf_mm", 4))
+            c.setFont(font_bold, 8)
+            c.setFillColor(colors.black)
+            c.drawString(
+                12 * mm,
+                y + 2 * mm,
+                f"Пруток {opening}: {'стык' if kind == 'joint' else 'деталь'}",
+            )
+            ly = y - detail_h
+            seam_x = left_x + detail_w
+            ltw = 4 * mm if left_tech == 50 else 2.5 * mm
+            rtw = 4 * mm if right_tech == 50 else 2.5 * mm
+            kw = 1.8 * mm if kerf_mm >= 4 else 1.2 * mm
+            yb = ly + detail_h
+            yt = ly
+
+            def _pdf_strip_card(
+                x0: float,
+                tech_w: float,
+                tech_mm_val: int,
+                title: str,
+                base_fill: colors.Color,
+            ) -> None:
+                ze = x0 + detail_w - kw
+                c.setStrokeColor(colors.HexColor("#e2e8f0"))
+                c.setFillColor(base_fill)
+                c.rect(x0, ly, detail_w, detail_h, stroke=1, fill=1)
+                c.setFillColor(colors.HexColor("#ffedd5"))
+                c.setStrokeColor(colors.HexColor("#ea580c"))
+                c.setLineWidth(0.3)
+                c.rect(x0, ly, tech_w, detail_h, stroke=1, fill=1)
+                c.setFillColor(colors.HexColor("#c2410c"))
+                c.setFont(font_bold, 6)
+                c.drawCentredString(x0 + tech_w / 2.0, yt + detail_h + 1.8 * mm, str(tech_mm_val))
+                kx0 = x0 + tech_w
+                c.setFillColor(colors.HexColor("#cffafe"))
+                c.setStrokeColor(colors.HexColor("#0e7490"))
+                c.rect(kx0, ly, kw, detail_h, stroke=1, fill=1)
+                c.setLineWidth(0.35)
+                c.line(kx0, yt, kx0, yb)
+                c.line(kx0 + kw, yt, kx0 + kw, yb)
+                c.setFillColor(colors.HexColor("#155e75"))
+                c.setFont(font_regular, 6)
+                c.drawCentredString(kx0 + kw / 2.0, ly + detail_h / 2.0 - 1.0, str(kerf_mm))
+                body_x = x0 + tech_w + kw
+                body_w = ze - body_x
+                c.setFillColor(base_fill)
+                c.setStrokeColor(base_fill)
+                c.rect(body_x, ly, body_w, detail_h, stroke=0, fill=1)
+                c.setStrokeColor(colors.HexColor("#0e7490"))
+                c.setFillColor(colors.HexColor("#cffafe"))
+                c.rect(ze, ly, kw, detail_h, stroke=1, fill=1)
+                c.line(ze, yt, ze, yb)
+                c.line(ze + kw, yt, ze + kw, yb)
+                c.setFillColor(colors.HexColor("#155e75"))
+                c.drawCentredString(ze + kw / 2.0, ly + detail_h / 2.0 - 1.0, str(kerf_mm))
+                c.setFillColor(colors.black)
+                c.setFont(font_regular, 7)
+                c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 2, title[:42])
+
+            _pdf_strip_card(
+                left_x,
+                ltw,
+                left_tech,
+                left_title,
+                colors.HexColor("#dbeafe"),
+            )
+            _pdf_strip_card(
+                seam_x,
+                rtw,
+                right_tech,
+                right_title,
+                colors.HexColor("#dcfce7"),
+            )
+            c.setStrokeColor(colors.HexColor("#0f172a"))
+            c.setLineWidth(0.8)
+            c.setDash(2, 2)
+            c.line(seam_x, ly - 1.0 * mm, seam_x, ly + detail_h + 1.0 * mm)
+            c.setDash()
+            c.setFont(font_bold, 7)
+            c.drawString(left_x + 1.0 * mm, ly - 4 * mm, f"L: {left_left_angle}°")
+            c.drawString(left_x + detail_w - 16 * mm, ly - 4 * mm, f"R: {left_angle}°")
+            c.drawString(seam_x + 1.0 * mm, ly - 4 * mm, f"L: {right_angle}°")
+            c.drawString(seam_x + detail_w - 16 * mm, ly - 4 * mm, f"R: {right_right_angle}°")
+            y = ly - 11 * mm
+        c.save()
+        QMessageBox.information(self, "Экспорт альбома", f"Сохранено:\n{p}")
 
     def _compute(self) -> None:
         logger.info("Compute requested")
@@ -1547,6 +2024,8 @@ class MainWindow(QMainWindow):
                 self.waste_chart.clear_data()
                 self.layout_widget.clear_plan()
                 self._layout_rows = []
+                self.album_widget.clear_rows()
+                self._album_rows = []
                 return
             demands = spec_rows_to_demands(rows)
             bars, bars_err = self._selected_bar_lengths(
@@ -1593,16 +2072,11 @@ class MainWindow(QMainWindow):
         self.advisor_text.setPlainText(full_summary)
         self._last_summary_text = full_summary
 
-        self._optimizer_cuts = list(result.cuts)
-        self._last_kerf_mm = kerf
-        self.btn_xlsx.setEnabled(True)
-        self.btn_pdf.setEnabled(True)
-        self.btn_recalc.setEnabled(True)
-        self.btn_layout_xlsx.setEnabled(True)
-        self.btn_layout_pdf.setEnabled(True)
-        self._update_layout_plan(result.cuts, kerf_mm=kerf)
-        self._apply_chart_metrics(chart_m)
-        self._apply_sort()
+        self._apply_optimization_result(
+            result=result,
+            kerf_mm=kerf,
+            chart_metrics=chart_m,
+        )
         logger.info(
             "Compute completed: cuts=%d new_bars=%d",
             len(result.cuts),
@@ -2027,13 +2501,11 @@ class MainWindow(QMainWindow):
             full += "\n\n" + "\n".join(self._chart_summary_lines(chart_m))
         self.advisor_text.setPlainText(full)
         self._last_summary_text = full
-        self._optimizer_cuts = list(result.cuts)
-        self._last_kerf_mm = kerf
-        self.btn_layout_xlsx.setEnabled(True)
-        self.btn_layout_pdf.setEnabled(True)
-        self._update_layout_plan(result.cuts, kerf_mm=kerf)
-        self._apply_chart_metrics(chart_m)
-        self._apply_sort()
+        self._apply_optimization_result(
+            result=result,
+            kerf_mm=kerf,
+            chart_metrics=chart_m,
+        )
         logger.info(
             "Recalc completed: cuts=%d new_bars=%d",
             len(result.cuts),
@@ -2146,25 +2618,26 @@ class MainWindow(QMainWindow):
                 cut_angle = int(d.cut_angle)
                 right_angle = int(d.cut_angle_2) if d.cut_angle_2 is not None else int(d.cut_angle)
                 tech = 30 if cut_angle == 90 else 50
-                # Перед каждой деталью: левый тех. отступ + левый пропил.
+                # Перед каждой деталью: левый тех. отступ + левый пропил (суммарно).
+                left_kerf = int(kerf_mm)
                 segs.append(
                     {
                         "kind": "tech",
-                        "length_mm": tech,
-                        "label": "тех. отступ",
-                        "angle": cut_angle,
+                        "length_mm": float(tech),
+                        "label": f"тех. {tech} мм",
+                        "tech_mm": tech,
                     }
                 )
                 consumed += tech
-                left_kerf = int(kerf_mm)
                 if left_kerf > 0:
                     segs.append(
                         {
                             "kind": "kerf",
-                            "length_mm": left_kerf,
-                            "label": "kerf",
-                            "side": "left",
+                            "length_mm": float(left_kerf),
+                            "label": "пропил",
+                            "side": "leading",
                             "angle": cut_angle,
+                            "kerf_mm": int(kerf_mm),
                         }
                     )
                     consumed += left_kerf
@@ -2203,9 +2676,10 @@ class MainWindow(QMainWindow):
                         {
                             "kind": "kerf",
                             "length_mm": right_kerf,
-                            "label": "kerf",
-                            "side": "right",
+                            "label": "пропил",
+                            "side": "trailing",
                             "angle": right_angle,
+                            "kerf_mm": int(kerf_mm),
                         }
                     )
                     consumed += right_kerf
@@ -2221,6 +2695,75 @@ class MainWindow(QMainWindow):
         color_map = self._profile_color_map(list(profile_names))
         self._layout_rows = rows
         self.layout_widget.set_plan(rows, color_map)
+
+    def _update_album_plan(self, cuts: list[CutEvent]) -> None:
+        by_opening: dict[int, list[CutEvent]] = defaultdict(list)
+        for c in cuts:
+            if c.stock_opening_id <= 0:
+                continue
+            by_opening[c.stock_opening_id].append(c)
+        rows: list[dict[str, object]] = []
+        profile_names: set[str] = set()
+        mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
+        for opening in sorted(by_opening):
+            g = by_opening[opening]
+            if mode == "details":
+                for c in g:
+                    d = c.demand
+                    prof = profile_label_for_code(d.profile_code)
+                    if prof == "—":
+                        prof = d.profile_code
+                    profile_names.add(prof)
+                    la = int(d.cut_angle)
+                    ra = int(d.cut_angle_2) if d.cut_angle_2 is not None else int(d.cut_angle)
+                    rows.append(
+                        {
+                            "kind": "detail",
+                            "opening": opening,
+                            "left_title": f"{self._module_short_name(d.module_name)} {d.profile_code} ({d.length_mm})",
+                            "right_title": f"{self._module_short_name(d.module_name)} {d.profile_code} ({d.length_mm})",
+                            "left_profile_name": prof,
+                            "right_profile_name": prof,
+                            "left_right_angle": la,
+                            "right_left_angle": ra,
+                            "left_left_angle": la,
+                            "right_right_angle": ra,
+                            "left_tech_mm": 30 if la == 90 else 50,
+                            "right_tech_mm": 30 if ra == 90 else 50,
+                            "kerf_mm": self._last_kerf_mm or 4,
+                        }
+                    )
+            else:
+                for i in range(len(g) - 1):
+                    left = g[i].demand
+                    right = g[i + 1].demand
+                    left_prof = profile_label_for_code(left.profile_code)
+                    right_prof = profile_label_for_code(right.profile_code)
+                    if left_prof == "—":
+                        left_prof = left.profile_code
+                    if right_prof == "—":
+                        right_prof = right.profile_code
+                    profile_names.add(left_prof)
+                    profile_names.add(right_prof)
+                    rows.append(
+                        {
+                            "kind": "joint",
+                            "opening": opening,
+                            "left_title": f"{self._module_short_name(left.module_name)} {left.profile_code} ({left.length_mm})",
+                            "right_title": f"{self._module_short_name(right.module_name)} {right.profile_code} ({right.length_mm})",
+                            "left_profile_name": left_prof,
+                            "right_profile_name": right_prof,
+                            "left_right_angle": int(left.cut_angle_2) if left.cut_angle_2 is not None else int(left.cut_angle),
+                            "right_left_angle": int(right.cut_angle),
+                            "left_left_angle": int(left.cut_angle),
+                            "right_right_angle": int(right.cut_angle_2) if right.cut_angle_2 is not None else int(right.cut_angle),
+                            "left_tech_mm": 30 if int(left.cut_angle) == 90 else 50,
+                            "right_tech_mm": 30 if int(right.cut_angle) == 90 else 50,
+                            "kerf_mm": self._last_kerf_mm or 4,
+                        }
+                    )
+        self._album_rows = rows
+        self.album_widget.set_rows(rows, self._profile_color_map(list(profile_names)))
 
     def _ordered_profile_names(self, names: set[str]) -> list[str]:
         """Порядок подписей как в сводке массы: Н20…Н23, затем остальные по алфавиту."""

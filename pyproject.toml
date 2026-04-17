@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+test = ["pytest>=7.0"]
 
 [project.scripts]
 nordfox-raskroy = "nordfox_raskroy.app:run_app"

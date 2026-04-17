@@ -6,6 +6,10 @@ from typing import Sequence
 
 from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
 from nordfox_raskroy.profile_codes import profile_label_for_code
+from nordfox_raskroy.profile_dimensions import (
+    extra_trailing_end_clearance_mm,
+    part_trailing_angle_deg,
+)
 logger = logging.getLogger("nordfox_raskroy.optimizer")
 
 
@@ -107,6 +111,9 @@ def optimize_cutting(
     Жадный best-fit по убыванию длины детали: сначала обрезки, затем новая заготовка.
     Остаток после реза возвращается в пул обрезков, если >= min_scrap_mm.
 
+    Для обрезка: к длине съёма добавляется геометрический запас по правому торцу
+    (угол правого подреза + габарит сечения), см. ``extra_trailing_end_clearance_mm``.
+
     initial_scraps_mm — куски со склада (каждый элемент = длина одного куска, мм).
     """
     logger.info(
@@ -148,9 +155,12 @@ def optimize_cutting(
     for d in sorted_demands:
         offset_mm = total_angle_offset_mm(d)
         cut_len = demand_cut_length_mm(d, kerf_mm)
+        trail_deg = part_trailing_angle_deg(d.cut_angle, d.cut_angle_2)
+        scrap_geo_mm = extra_trailing_end_clearance_mm(d.profile_code, trail_deg)
+        cut_len_on_scrap = cut_len + scrap_geo_mm
         prof_key = _scrap_profile_key(d.profile_code)
         logger.info(
-            "demand processing: row=%s module=%s profile=%s key=%s len=%d angle=%s offset=%d cut_len=%d scraps=%d",
+            "demand processing: row=%s module=%s profile=%s key=%s len=%d angle=%s offset=%d cut_len=%d trail=%d scrap_geo=%d cut_on_scrap=%d scraps=%d",
             d.spec_row_index,
             d.module_name,
             d.profile_code,
@@ -159,6 +169,9 @@ def optimize_cutting(
             format_cut_angles(d),
             offset_mm,
             cut_len,
+            trail_deg,
+            scrap_geo_mm,
+            cut_len_on_scrap,
             len(scraps),
         )
         best: tuple[int, int, str] | None = None
@@ -167,7 +180,7 @@ def optimize_cutting(
         for length_mm, oid, prof in scraps:
             if prof not in ("*", prof_key):
                 continue
-            if length_mm >= cut_len:
+            if length_mm >= cut_len_on_scrap:
                 waste = length_mm - cut_len
                 if best_waste is None or waste < best_waste or (
                     waste == best_waste and best is not None and oid < best[1]

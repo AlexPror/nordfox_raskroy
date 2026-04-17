@@ -15,6 +15,7 @@ from nordfox_raskroy.optimizer import (  # noqa: E402
     spec_rows_to_demands,
     summarize,
 )
+from nordfox_raskroy.profile_dimensions import extra_trailing_end_clearance_mm  # noqa: E402
 from nordfox_raskroy.profile_codes import filter_spec_by_profiles  # noqa: E402
 
 
@@ -26,15 +27,20 @@ class OptimizerTests(unittest.TestCase):
     def test_demand_cut_length_includes_offset_and_kerf(self):
         d90 = PartDemand(1, "M", "a", 1000, 90)
         d45 = PartDemand(2, "M", "b", 1000, 45)
-        self.assertEqual(demand_cut_length_mm(d90, kerf_mm=2), 1032)
-        self.assertEqual(demand_cut_length_mm(d45, kerf_mm=2), 1052)
+        # length + техотступ + 2×kerf (см. optimizer.demand_cut_length_mm)
+        self.assertEqual(demand_cut_length_mm(d90, kerf_mm=2), 1000 + 30 + 4)
+        self.assertEqual(demand_cut_length_mm(d45, kerf_mm=2), 1000 + 50 + 4)
 
-    def test_two_angles_sum_offsets(self):
+    def test_two_angles_only_first_counts_for_length(self):
         d = PartDemand(1, "M", "a", 1000, 90, cut_angle_2=45)
-        self.assertEqual(demand_cut_length_mm(d, kerf_mm=0), 1000 + 30 + 50)
+        self.assertEqual(demand_cut_length_mm(d, kerf_mm=0), 1000 + 30)
 
     def test_optimize_applies_offset_for_each_cut(self):
-        demands = [PartDemand(1, "M", "a", 1000, 90), PartDemand(2, "M", "b", 1000, 45)]
+        # Один профиль — хвост первого реза можно резать второй деталью.
+        demands = [
+            PartDemand(1, "M", "СК-0-1000", 1000, 90),
+            PartDemand(2, "M", "СК-0-2000", 1000, 45),
+        ]
         r = optimize_cutting(
             demands,
             bar_lengths_mm=[6000],
@@ -55,8 +61,8 @@ class OptimizerTests(unittest.TestCase):
 
     def test_optimize_prefers_scrap_before_new_bar(self):
         demands = [
-            PartDemand(1, "M", "a", 3000, 90),
-            PartDemand(2, "M", "b", 2900, 90),
+            PartDemand(1, "M", "СК-0-1", 3000, 90),
+            PartDemand(2, "M", "СК-0-2", 2900, 90),
         ]
         r = optimize_cutting(
             demands,
@@ -72,9 +78,9 @@ class OptimizerTests(unittest.TestCase):
     def test_stock_opening_order_new_bar_then_scrap_same_lineage(self):
         """Сначала строки по 1-му прутку (новый + хвост), затем по следующему."""
         demands = [
-            PartDemand(1, "M", "a", 3000, 90),
-            PartDemand(2, "M", "b", 2900, 90),
-            PartDemand(3, "M", "c", 500, 90),
+            PartDemand(1, "M", "СК-0-1", 3000, 90),
+            PartDemand(2, "M", "СК-0-2", 2900, 90),
+            PartDemand(3, "M", "СК-0-3", 500, 90),
         ]
         r = optimize_cutting(
             demands,
@@ -88,6 +94,34 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(ids[1], 1)
         new_ids = {c.stock_opening_id for c in r.cuts if c.stock_source == "new_bar"}
         self.assertEqual(new_ids, {1, 2})
+
+    def test_scrap_rejected_if_short_for_trailing_miter_geometry(self):
+        """Обрезок достаточен по 1D cut_len, но короче cut_len + гео. запаса — берём новый пруток."""
+        # Н20: h_max=60, trailing 45° -> +60 мм к длине куска при выборе обрезка.
+        self.assertEqual(extra_trailing_end_clearance_mm("СК-0-1", 45), 60)
+        d = PartDemand(1, "M", "СК-0-1", 1000, 45)
+        self.assertEqual(demand_cut_length_mm(d, kerf_mm=0), 1050)
+        r = optimize_cutting(
+            [d],
+            bar_lengths_mm=[6000],
+            kerf_mm=0,
+            min_scrap_mm=50,
+            initial_scraps_mm=[1100],
+        )
+        self.assertEqual(r.cuts[0].stock_source, "new_bar")
+        self.assertEqual(r.cuts[0].stock_length_mm, 6000)
+
+    def test_scrap_accepted_when_long_enough_for_miter(self):
+        d = PartDemand(1, "M", "СК-0-1", 1000, 45)
+        r = optimize_cutting(
+            [d],
+            bar_lengths_mm=[6000],
+            kerf_mm=0,
+            min_scrap_mm=50,
+            initial_scraps_mm=[1110],
+        )
+        self.assertEqual(r.cuts[0].stock_source, "scrap")
+        self.assertEqual(r.cuts[0].stock_length_mm, 1110)
 
 
 class ExcelPipelineTests(unittest.TestCase):
