@@ -15,8 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "build>=1.0", "wheel"]
 test = ["pytest>=7.0"]
+build = ["build>=1.0", "wheel"]
 
 [project.scripts]
 nordfox-raskroy = "nordfox_raskroy.app:run_app"

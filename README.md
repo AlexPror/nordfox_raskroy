@@ -56,6 +56,22 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+### Сборка wheel/sdist (пересборка артефактов)
+
+Из корня репозитория (Windows):
+
+```bat
+build.bat
+```
+
+Появится каталог `dist\` с `.whl` и архивом исходников. Установка из wheel:
+
+```bat
+pip install dist\nordfox_raskroy-*-py3-none-any.whl
+```
+
+План развития и чек-листы для соло-разработки: `docs/DEVELOPMENT_PLAN.md`, журнал релизов: `CHANGELOG.md`.
+
 ## Быстрый старт
 
 Запуск Qt-приложения:
