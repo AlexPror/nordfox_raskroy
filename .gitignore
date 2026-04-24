@@ -22,3 +22,6 @@ test/_block_unzip/
 
 # Local debug/log files
 лог1.txt
+
+# Local reference PDFs (not used by runtime)
+profile_drawings/
