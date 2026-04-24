@@ -36,6 +36,7 @@ py -3.11 -m PyInstaller ^
   --onedir ^
   --clean ^
   --paths src ^
+  --add-data "src\nordfox_raskroy\assets;nordfox_raskroy\assets" ^
   --collect-all PySide6 ^
   --collect-all reportlab ^
   --collect-all openpyxl ^
