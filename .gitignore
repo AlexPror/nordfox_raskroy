@@ -8,3 +8,17 @@ build/
 .venv/
 venv/
 logs/
+
+# Local build artifacts
+wheelhouse/
+
+# Generated export files for manual test runs
+test/*.pdf
+test/*.xlsx
+test/*.dxf
+test/*.frw
+test/*.frw.bak
+test/_block_unzip/
+
+# Local debug/log files
+лог1.txt

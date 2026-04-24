@@ -60,11 +60,8 @@ except ImportError as e:  # pragma: no cover
         "Нужен пакет PySide6. Установите: pip install PySide6"
     ) from e
 
-from nordfox_raskroy.bar_scenarios import (
-    compare_bar_scenarios,
-    format_scenario_report,
-    pick_recommended,
-)
+from nordfox_raskroy.bar_advisor_service import run_bar_advisor
+from nordfox_raskroy.album_plan_service import build_album_plan_rows
 from nordfox_raskroy.excel_io import (
     parse_project_metadata,
     parse_specification,
@@ -72,6 +69,7 @@ from nordfox_raskroy.excel_io import (
 )
 from nordfox_raskroy.export_results import export_cuts_excel, export_cuts_pdf
 from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
+from nordfox_raskroy.module_names import module_order_key
 from nordfox_raskroy.module_colors import module_row_rgb
 from nordfox_raskroy.optimizer import (
     demand_cut_length_mm,
@@ -88,13 +86,19 @@ from nordfox_raskroy.materials_library import (
     save_editable_profile_entries,
     total_mass_kg,
 )
+from nordfox_raskroy.layout_plan_service import build_layout_plan_rows
+from nordfox_raskroy.pdf_fonts import reportlab_cyrillic_fonts
 from nordfox_raskroy.profile_codes import (
     PROFILE_DIGIT_TO_NAME,
-    filter_spec_by_profiles,
     parse_profile_series_digit,
     profile_label_for_code,
 )
+from nordfox_raskroy.profile_names import display_profile_name
 from nordfox_raskroy.scrap_stock_io import parse_scrap_inventory
+from nordfox_raskroy.spec_profile_filters import (
+    filter_rows_by_selected_profiles,
+    profile_filter_key,
+)
 from nordfox_raskroy import __version__
 from nordfox_raskroy.table_demand_import import demands_from_cut_table_rows
 logger = logging.getLogger("nordfox_raskroy.qt_app")
@@ -105,34 +109,6 @@ _TECH_VIS_LINE = QColor(234, 88, 12)
 _KERF_VIS_FILL = QColor(207, 250, 254)
 _KERF_VIS_LINE = QColor(14, 116, 144)
 _LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nordfox_logo.png"
-
-
-def _reportlab_cyrillic_fonts() -> tuple[str, str]:
-    """Имена шрифтов ReportLab с поддержкой кириллицы; иначе Helvetica (без кириллицы)."""
-    try:
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-    except ImportError:
-        return "Helvetica", "Helvetica-Bold"
-    if "NF-Regular" in pdfmetrics.getRegisteredFontNames():
-        return "NF-Regular", "NF-Bold"
-    candidates = [
-        (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\arialbd.ttf")),
-        (Path(r"C:\Windows\Fonts\DejaVuSans.ttf"), Path(r"C:\Windows\Fonts\DejaVuSans-Bold.ttf")),
-        (
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        ),
-    ]
-    for reg_path, bold_path in candidates:
-        if reg_path.is_file() and bold_path.is_file():
-            try:
-                pdfmetrics.registerFont(TTFont("NF-Regular", str(reg_path)))
-                pdfmetrics.registerFont(TTFont("NF-Bold", str(bold_path)))
-                return "NF-Regular", "NF-Bold"
-            except Exception:  # noqa: BLE001
-                logger.exception("reportlab TTF register failed: %s", reg_path)
-    return "Helvetica", "Helvetica-Bold"
 
 
 def _paint_diagonal_hatch(
@@ -1620,25 +1596,16 @@ class MainWindow(QMainWindow):
             name = (row.module_name or "").strip()
             if name:
                 found.add(name)
-        return sorted(found, key=self._module_order_key)
+        return sorted(found, key=module_order_key)
 
     def _profiles_by_module_from_rows(self, rows_all: list[SpecRow]) -> dict[str, set[str]]:
         mapping: dict[str, set[str]] = defaultdict(set)
         for row in rows_all:
             module = (row.module_name or "").strip()
-            profile = self._profile_filter_key(row.profile_code)
+            profile = profile_filter_key(row.profile_code)
             if module and profile:
                 mapping[module].add(profile)
         return mapping
-
-    def _profile_filter_key(self, profile_code: str) -> str:
-        code = (profile_code or "").strip()
-        if not code:
-            return ""
-        series = profile_label_for_code(code)
-        if series != "—":
-            return series
-        return code
 
     def _refresh_filters_from_path(self) -> None:
         path = self.path_edit.text().strip()
@@ -1678,7 +1645,7 @@ class MainWindow(QMainWindow):
     def _profile_codes_from_rows(self, rows_all: list[SpecRow]) -> list[str]:
         found: set[str] = set()
         for row in rows_all:
-            code = self._profile_filter_key(row.profile_code)
+            code = profile_filter_key(row.profile_code)
             if code:
                 found.add(code)
         return sorted(found)
@@ -1717,23 +1684,6 @@ class MainWindow(QMainWindow):
                 cb.setChecked(True)
             return set(self.profile_checks.keys())
         return {name for name, cb in self.profile_checks.items() if cb.isChecked()}
-
-    def _filter_rows_by_selected_profiles(
-        self,
-        rows_all: list[SpecRow],
-        allowed_profiles: set[str],
-    ) -> tuple[list[SpecRow], list[str]]:
-        kept: list[SpecRow] = []
-        warns: list[str] = []
-        for row in rows_all:
-            key = self._profile_filter_key(row.profile_code)
-            if key in allowed_profiles:
-                kept.append(row)
-            else:
-                warns.append(
-                    f"Строка {row.row_index}: «{row.profile_code}» ({key}) не включён в раскрой"
-                )
-        return kept, warns
 
     def _allowed_modules(self) -> set[str]:
         mode = self.profile_mode_combo.currentData()
@@ -2103,7 +2053,7 @@ class MainWindow(QMainWindow):
                 return None, "После фильтра по модулям нет строк", []
             if not allowed:
                 return None, "По текущему фильтру профилей нет выбранных профилей", []
-            rows, warns = self._filter_rows_by_selected_profiles(rows_all, allowed)
+            rows, warns = filter_rows_by_selected_profiles(rows_all, allowed)
         except Exception as e:  # noqa: BLE001
             return None, str(e), []
         if not rows:
@@ -2136,100 +2086,30 @@ class MainWindow(QMainWindow):
         if base_len > 12000:
             QMessageBox.critical(self, "Ошибка", "Базовая длина не должна превышать 12000 мм")
             return
-        min_scrap = 0
         initial, scrap_warns = self._load_initial_scraps()
-        required_max = max(
-            (
-                demand_cut_length_mm(
-                    d,
-                    kerf,
-                    offset_90_mm=offset_90,
-                    offset_other_mm=offset_other,
-                )
-                for d in demands
-            ),
-            default=0,
-        )
-        if required_max > 12000:
-            QMessageBox.critical(
-                self,
-                "Ошибка",
-                "Есть детали, требующие заготовку больше 12000 мм "
-                f"(максимум требуется: {required_max} мм)",
-            )
-            return
-        standard_mode = int(self.length_mode_slider.value()) >= 1
-        if standard_mode:
-            # Подбираем только технологичные длины (кратно 50 мм),
-            # чтобы не рекомендовать "случайные" нестандартные значения вроде 6881.
-            step_mm = 50
-            scan_from = ((required_max + 49) // 50) * 50
-            scan_to = 12000
-            candidates = set(range(scan_from, scan_to + 1, step_mm))
-            if base_len % step_mm == 0:
-                candidates.add(base_len)
-            candidates = {x for x in candidates if scan_from <= x <= 12000}
-            scenarios = [(f"Только {b} мм", (b,)) for b in sorted(candidates)]
-            outcomes = compare_bar_scenarios(
-                demands,
-                kerf_mm=kerf,
-                offset_90_mm=offset_90,
-                offset_other_mm=offset_other,
-                min_scrap_mm=min_scrap,
-                initial_scraps_mm=initial if initial else None,
-                scenarios=scenarios,
-            )
-        else:
-            # Быстрый двухэтапный режим:
-            # 1) грубый поиск по 50 мм на всём диапазоне;
-            # 2) уточнение по 1 мм в окрестности лучших кандидатов.
-            coarse_from = ((required_max + 49) // 50) * 50
-            coarse_to = 12000
-            coarse_candidates = set(range(coarse_from, coarse_to + 1, 50))
-            if base_len % 50 == 0 and base_len >= coarse_from:
-                coarse_candidates.add(base_len)
-            coarse_scenarios = [(f"Только {b} мм", (b,)) for b in sorted(coarse_candidates)]
-            coarse_outcomes = compare_bar_scenarios(
-                demands,
-                kerf_mm=kerf,
-                offset_90_mm=offset_90,
-                offset_other_mm=offset_other,
-                min_scrap_mm=min_scrap,
-                initial_scraps_mm=initial if initial else None,
-                scenarios=coarse_scenarios,
-            )
-            coarse_ok = [o for o in coarse_outcomes if o.ok and o.result is not None]
-            if coarse_ok:
-                top = sorted(coarse_ok, key=lambda o: (o.waste_pct, o.total_bars, o.material_mm))[:5]
-                refine_candidates: set[int] = set()
-                for o in top:
-                    center = o.bars_mm[0]
-                    lo = max(required_max, center - 60)
-                    hi = min(12000, center + 60)
-                    refine_candidates.update(range(lo, hi + 1))
-                refine_candidates.add(required_max)
-                refine_candidates.add(min(12000, base_len))
-                refine_scenarios = [(f"Только {b} мм", (b,)) for b in sorted(refine_candidates)]
-                outcomes = compare_bar_scenarios(
-                    demands,
-                    kerf_mm=kerf,
-                    offset_90_mm=offset_90,
-                    offset_other_mm=offset_other,
-                    min_scrap_mm=min_scrap,
-                    initial_scraps_mm=initial if initial else None,
-                    scenarios=refine_scenarios,
-                )
-            else:
-                outcomes = coarse_outcomes
         mode = "waste_first"
-        text = format_scenario_report(outcomes, mode=mode)
+        try:
+            advisor = run_bar_advisor(
+                demands,
+                kerf_mm=kerf,
+                offset_90_mm=offset_90,
+                offset_other_mm=offset_other,
+                base_len_mm=base_len,
+                standard_mode=int(self.length_mode_slider.value()) >= 1,
+                initial_scraps_mm=initial,
+                min_scrap_mm=0,
+                mode=mode,
+            )
+        except ValueError as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+            return
+        text = advisor.report_text
         extra = list(fw) + list(scrap_warns)
         if extra:
             text += "\n\n" + "\n".join(extra[:15])
-        rec = pick_recommended(outcomes, mode=mode)
-        self._recommended_bars = rec.bars_mm if rec else None
-        if rec and rec.bars_mm:
-            recommended_len = rec.bars_mm[0]
+        self._recommended_bars = advisor.recommended_bars_mm
+        if advisor.recommended_length_mm is not None:
+            recommended_len = advisor.recommended_length_mm
             self.base_bar_edit.setText(str(recommended_len))
             text += (
                 "\n\n"
@@ -2239,11 +2119,11 @@ class MainWindow(QMainWindow):
         self.advisor_text.setPlainText(text)
         logger.info(
             "Bar advisor completed: scenarios=%d recommended=%s mode=%s",
-            len(outcomes),
-            rec.name if rec else "none",
+            len(advisor.outcomes),
+            advisor.recommended_name or "none",
             mode,
         )
-        if rec and rec.bars_mm:
+        if advisor.recommended_bars_mm:
             self._compute()
 
     def _apply_recommended_bars(self) -> None:
@@ -2402,7 +2282,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         base_page = A3 if "A3" in fmt else A4
-        font_regular, font_bold = _reportlab_cyrillic_fonts()
+        font_regular, font_bold = reportlab_cyrillic_fonts(logger)
         c = canvas.Canvas(str(Path(p)), pagesize=landscape(base_page))
         pw, ph = landscape(base_page)
         all_profile_names: set[str] = set()
@@ -2666,7 +2546,7 @@ class MainWindow(QMainWindow):
         except ImportError as e:  # pragma: no cover
             QMessageBox.critical(self, "Экспорт альбома", f"Нужен reportlab: {e}")
             return
-        font_regular, font_bold = _reportlab_cyrillic_fonts()
+        font_regular, font_bold = reportlab_cyrillic_fonts(logger)
         c = canvas.Canvas(str(Path(p)), pagesize=A4)
         pw, ph = A4
         def _draw_pdf_header() -> float:
@@ -2908,7 +2788,7 @@ class MainWindow(QMainWindow):
             if not allowed:
                 QMessageBox.critical(self, "Ошибка", "По текущему фильтру профилей нет выбранных профилей")
                 return
-            rows, warns = self._filter_rows_by_selected_profiles(rows_all, allowed)
+            rows, warns = filter_rows_by_selected_profiles(rows_all, allowed)
             logger.info(
                 "Specification loaded: total_rows=%d filtered_rows=%d filtered_out=%d",
                 len(rows_all),
@@ -3037,9 +2917,7 @@ class MainWindow(QMainWindow):
             kg, mtxt = row_mass_kg_display(d.profile_code, float(d.length_mm), 1.0)
             if kg is not None:
                 total_kg += kg
-                prof_name = profile_label_for_code(d.profile_code)
-                if prof_name == "—":
-                    prof_name = d.profile_code
+                prof_name = display_profile_name(d.profile_code)
                 mass_by_profile[prof_name] += kg
                 any_mass = True
             op_txt = (
@@ -3130,9 +3008,7 @@ class MainWindow(QMainWindow):
             if cut.stock_source != "new_bar":
                 continue
             code = cut.demand.profile_code
-            profile_type = profile_label_for_code(code)
-            if profile_type == "—":
-                profile_type = code
+            profile_type = display_profile_name(code)
             bar_len = int(cut.stock_length_mm)
             key = (profile_type, bar_len)
             old = purchase_rows.get(key, (0, 0.0))
@@ -3463,9 +3339,7 @@ class MainWindow(QMainWindow):
                 unknown += 1
                 continue
             total_kg += kg
-            label = profile_label_for_code(d.profile_code)
-            if label == "—":
-                label = d.profile_code
+            label = display_profile_name(d.profile_code)
             by_profile_kg[label] += kg
 
         lines: list[str] = []
@@ -3537,18 +3411,6 @@ class MainWindow(QMainWindow):
             out[n] = _soft(QColor.fromHsv(int(hue), 110, 215))
         return out
 
-    def _module_order_key(self, name: str) -> tuple[int, str]:
-        m = re.search(r"[MМ]\s*(\d+)", name, flags=re.IGNORECASE)
-        if m:
-            return (int(m.group(1)), name)
-        return (10**9, name)
-
-    def _module_short_name(self, name: str) -> str:
-        m = re.search(r"[MМ]\s*(\d+)", name, flags=re.IGNORECASE)
-        if m:
-            return f"М{int(m.group(1))}"
-        return name
-
     def _update_layout_plan(
         self,
         cuts: list[CutEvent],
@@ -3557,181 +3419,39 @@ class MainWindow(QMainWindow):
         offset_other_mm: int,
     ) -> None:
         """Готовит данные для вкладки схемы раскроя (прямоугольники-прутки)."""
-        by_opening: dict[int, list[CutEvent]] = defaultdict(list)
-        for c in cuts:
-            if c.stock_opening_id <= 0:
-                continue
-            by_opening[c.stock_opening_id].append(c)
-        if not by_opening:
+        plan = build_layout_plan_rows(
+            cuts,
+            kerf_mm=kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+            opening_color_rgb=lambda opening: (
+                opening_row_color(opening).red(),
+                opening_row_color(opening).green(),
+                opening_row_color(opening).blue(),
+            ),
+        )
+        if not plan.rows:
             self._layout_rows = []
             self.layout_widget.clear_plan()
             return
-
-        rows: list[dict[str, object]] = []
-        profile_names: set[str] = set()
-        for opening in sorted(by_opening):
-            group = by_opening[opening]
-            first_new = next((c for c in group if c.stock_source == "new_bar"), None)
-            if first_new is None:
-                continue
-            bar_len = int(first_new.stock_length_mm)
-            segs: list[dict[str, object]] = []
-            consumed = 0
-            for c in group:
-                d = c.demand
-                profile_name = profile_label_for_code(d.profile_code)
-                if profile_name == "—":
-                    profile_name = d.profile_code
-                profile_names.add(profile_name)
-                cut_angle = int(d.cut_angle)
-                right_angle = int(d.cut_angle_2) if d.cut_angle_2 is not None else int(d.cut_angle)
-                tech = int(offset_90_mm) if cut_angle == 90 else int(offset_other_mm)
-                # Перед каждой деталью: левый тех. отступ + левый пропил (суммарно).
-                left_kerf = int(kerf_mm)
-                segs.append(
-                    {
-                        "kind": "tech",
-                        "length_mm": float(tech),
-                        "label": f"тех. {tech} мм",
-                        "tech_mm": tech,
-                    }
-                )
-                consumed += tech
-                if left_kerf > 0:
-                    segs.append(
-                        {
-                            "kind": "kerf",
-                            "length_mm": float(left_kerf),
-                            "label": "пропил",
-                            "side": "leading",
-                            "angle": cut_angle,
-                            "kerf_mm": int(kerf_mm),
-                        }
-                    )
-                    consumed += left_kerf
-                segs.append(
-                    {
-                        "kind": "profile",
-                        "length_mm": int(d.length_mm),
-                        "label": f"{self._module_short_name(d.module_name)} {d.profile_code}",
-                        "module_name": d.module_name,
-                        "profile_code": d.profile_code,
-                        "part_length_mm": int(d.length_mm),
-                        "cut_angles": format_cut_angles(d),
-                        "left_angle": cut_angle,
-                        "right_angle": right_angle,
-                        "source_label": "Обрезок" if c.stock_source == "scrap" else "Новая",
-                        "opening_color": (
-                            opening_row_color(opening).red(),
-                            opening_row_color(opening).green(),
-                            opening_row_color(opening).blue(),
-                        ),
-                        "profile_name": profile_name,
-                        "is_scrap": c.stock_source == "scrap",
-                        "origin": (
-                            "из склада"
-                            if c.stock_source == "scrap" and c.stock_opening_id == 0
-                            else f"из прутка {c.stock_opening_id}"
-                            if c.stock_source == "scrap"
-                            else f"новый пруток {opening}"
-                        ),
-                    }
-                )
-                consumed += int(d.length_mm)
-                right_kerf = int(kerf_mm)
-                if right_kerf > 0:
-                    segs.append(
-                        {
-                            "kind": "kerf",
-                            "length_mm": right_kerf,
-                            "label": "пропил",
-                            "side": "trailing",
-                            "angle": right_angle,
-                            "kerf_mm": int(kerf_mm),
-                        }
-                    )
-                    consumed += right_kerf
-            remainder = max(bar_len - consumed, 0)
-            rows.append(
-                {
-                    "opening": opening,
-                    "bar_len": bar_len,
-                    "segments": segs,
-                    "remainder": remainder,
-                }
-            )
-        color_map = self._profile_color_map(list(profile_names))
-        self._layout_rows = rows
-        self.layout_widget.set_plan(rows, color_map)
+        color_map = self._profile_color_map(list(plan.profile_names))
+        self._layout_rows = plan.rows
+        self.layout_widget.set_plan(plan.rows, color_map)
 
     def _update_album_plan(self, cuts: list[CutEvent]) -> None:
-        by_opening: dict[int, list[CutEvent]] = defaultdict(list)
-        for c in cuts:
-            if c.stock_opening_id <= 0:
-                continue
-            by_opening[c.stock_opening_id].append(c)
-        rows: list[dict[str, object]] = []
-        profile_names: set[str] = set()
         mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
-        for opening in sorted(by_opening):
-            g = by_opening[opening]
-            if mode == "details":
-                for c in g:
-                    d = c.demand
-                    prof = profile_label_for_code(d.profile_code)
-                    if prof == "—":
-                        prof = d.profile_code
-                    profile_names.add(prof)
-                    la = int(d.cut_angle)
-                    ra = int(d.cut_angle_2) if d.cut_angle_2 is not None else int(d.cut_angle)
-                    rows.append(
-                        {
-                            "kind": "detail",
-                            "opening": opening,
-                            "left_title": f"{self._module_short_name(d.module_name)} {d.profile_code}",
-                            "right_title": "",
-                            "left_profile_name": prof,
-                            "right_profile_name": prof,
-                            "left_right_angle": la,
-                            "right_left_angle": ra,
-                            "left_left_angle": la,
-                            "right_right_angle": ra,
-                            "left_tech_mm": self._last_offset_90_mm if la == 90 else self._last_offset_other_mm,
-                            "right_tech_mm": self._last_offset_90_mm if ra == 90 else self._last_offset_other_mm,
-                            "kerf_mm": self._last_kerf_mm or 4,
-                        }
-                    )
-            else:
-                for i in range(len(g) - 1):
-                    left = g[i].demand
-                    right = g[i + 1].demand
-                    left_prof = profile_label_for_code(left.profile_code)
-                    right_prof = profile_label_for_code(right.profile_code)
-                    if left_prof == "—":
-                        left_prof = left.profile_code
-                    if right_prof == "—":
-                        right_prof = right.profile_code
-                    profile_names.add(left_prof)
-                    profile_names.add(right_prof)
-                    rows.append(
-                        {
-                            "kind": "joint",
-                            "opening": opening,
-                            "left_title": f"{self._module_short_name(left.module_name)} {left.profile_code}",
-                            "right_title": f"{self._module_short_name(right.module_name)} {right.profile_code}",
-                            "left_profile_name": left_prof,
-                            "right_profile_name": right_prof,
-                            "left_right_angle": int(left.cut_angle_2) if left.cut_angle_2 is not None else int(left.cut_angle),
-                            "right_left_angle": int(right.cut_angle),
-                            "left_left_angle": int(left.cut_angle),
-                            "right_right_angle": int(right.cut_angle_2) if right.cut_angle_2 is not None else int(right.cut_angle),
-                            "left_tech_mm": self._last_offset_90_mm if int(left.cut_angle) == 90 else self._last_offset_other_mm,
-                            "right_tech_mm": self._last_offset_90_mm if int(right.cut_angle) == 90 else self._last_offset_other_mm,
-                            "kerf_mm": self._last_kerf_mm or 4,
-                        }
-                    )
-        self._album_rows = rows
-        self.album_widget.set_rows(rows, self._profile_color_map(list(profile_names)))
+        album_plan = build_album_plan_rows(
+            cuts,
+            mode=("details" if mode == "details" else "joints"),
+            offset_90_mm=self._last_offset_90_mm,
+            offset_other_mm=self._last_offset_other_mm,
+            kerf_mm=self._last_kerf_mm or 4,
+        )
+        self._album_rows = album_plan.rows
+        self.album_widget.set_rows(
+            album_plan.rows,
+            self._profile_color_map(list(album_plan.profile_names)),
+        )
 
     def _ordered_profile_names(self, names: set[str]) -> list[str]:
         """Порядок подписей как в сводке массы: Н20…Н23, затем остальные по алфавиту."""
@@ -3767,9 +3487,7 @@ class MainWindow(QMainWindow):
 
         for c in result.cuts:
             d = c.demand
-            label = profile_label_for_code(d.profile_code)
-            if label == "—":
-                label = d.profile_code
+            label = display_profile_name(d.profile_code)
 
             used_kg, _ = row_mass_kg_display(d.profile_code, float(d.length_mm), 1.0)
             if used_kg is not None:

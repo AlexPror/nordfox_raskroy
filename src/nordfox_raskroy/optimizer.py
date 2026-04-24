@@ -82,7 +82,7 @@ def spec_rows_to_demands(rows: list[SpecRow]) -> list[PartDemand]:
             if sr.cut_angle_2 is not None
             else str(sr.cut_angle)
         )
-        logger.info(
+        logger.debug(
             "spec_row expanded: row=%s module=%s profile=%s len=%d angle=%s qty=%d",
             sr.row_index,
             sr.module_name,
@@ -216,7 +216,7 @@ def optimize_cutting(
         scrap_geo_mm = extra_trailing_end_clearance_mm(d.profile_code, trail_deg)
         cut_len_on_scrap = cut_len + scrap_geo_mm
         prof_key = _scrap_profile_key(d.profile_code)
-        logger.info(
+        logger.debug(
             "demand processing: row=%s module=%s profile=%s key=%s len=%d angle=%s offset=%d cut_len=%d trail=%d scrap_geo=%d cut_on_scrap=%d scraps=%d",
             d.spec_row_index,
             d.module_name,
@@ -252,7 +252,7 @@ def optimize_cutting(
             rem = best_waste
             if rem >= min_scrap_mm:
                 scraps.append((rem, opening_id, prof_key))
-            logger.info(
+            logger.debug(
                 "cut from scrap: profile=%s key=%s len=%d source=%d source_key=%s rem=%d rem_saved=%s opening=%d",
                 d.profile_code,
                 prof_key,
@@ -282,7 +282,7 @@ def optimize_cutting(
         result.bars_used[bar] = result.bars_used.get(bar, 0) + 1
         if rem >= min_scrap_mm:
             scraps.append((rem, opening_id, prof_key))
-        logger.info(
+        logger.debug(
             "cut from new bar: profile=%s len=%d bar=%d rem=%d rem_saved=%s bar_count=%d opening=%d",
             d.profile_code,
             d.length_mm,
