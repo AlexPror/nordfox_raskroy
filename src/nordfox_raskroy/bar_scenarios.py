@@ -45,6 +45,8 @@ def evaluate_scenario(
     bars_mm: tuple[int, ...],
     *,
     kerf_mm: int,
+    offset_90_mm: int,
+    offset_other_mm: int,
     min_scrap_mm: int,
     initial_scraps_mm: list[int] | None,
 ) -> ScenarioOutcome:
@@ -54,6 +56,8 @@ def evaluate_scenario(
             demands,
             bar_lengths_mm=list(bars_mm),
             kerf_mm=kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
             min_scrap_mm=min_scrap_mm,
             initial_scraps_mm=initial_scraps_mm,
         )
@@ -81,6 +85,8 @@ def compare_bar_scenarios(
     demands: list[PartDemand],
     *,
     kerf_mm: int,
+    offset_90_mm: int = 30,
+    offset_other_mm: int = 50,
     min_scrap_mm: int,
     initial_scraps_mm: list[int] | None = None,
     scenarios: list[tuple[str, tuple[int, ...]]] | None = None,
@@ -99,6 +105,8 @@ def compare_bar_scenarios(
             name,
             bars,
             kerf_mm=kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
             min_scrap_mm=min_scrap_mm,
             initial_scraps_mm=initial_scraps_mm,
         )

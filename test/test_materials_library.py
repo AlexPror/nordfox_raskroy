@@ -16,14 +16,14 @@ from nordfox_raskroy.materials_library import (  # noqa: E402
 
 class MaterialsLibraryTests(unittest.TestCase):
     def test_series_digits_match_nordfox(self):
-        self.assertEqual(kg_per_meter_nordfox_series(0), 1.0315)
-        self.assertEqual(kg_per_meter_nordfox_series(3), 1.209)
+        self.assertEqual(kg_per_meter_nordfox_series(0), 0.937)
+        self.assertEqual(kg_per_meter_nordfox_series(3), 1.48)
 
     def test_codes_without_suffix_letters(self):
         for code, exp in [
-            ("СК-1-456", 1.206),
-            ("СС-2-554", 1.2075),
-            ("Р-0-1230", 1.0315),
+            ("СК-1-456", 1.132),
+            ("СС-2-554", 1.358),
+            ("Р-0-1230", 0.937),
         ]:
             with self.subTest(code=code):
                 m = kg_per_meter_from_profile_code(code)

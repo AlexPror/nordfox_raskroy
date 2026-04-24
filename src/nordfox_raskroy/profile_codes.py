@@ -51,11 +51,25 @@ def profile_label_for_code(profile_code: str) -> str:
 
 def filter_spec_by_profiles(
     rows: list[SpecRow],
-    allowed_digits: set[int],
+    allowed_profiles: set[int] | set[str],
 ) -> tuple[list[SpecRow], list[str]]:
     kept: list[SpecRow] = []
     warnings: list[str] = []
+    as_text_mode = any(isinstance(x, str) for x in allowed_profiles)
+    allowed_codes = {
+        str(x).strip().upper() for x in allowed_profiles if isinstance(x, str) and str(x).strip()
+    }
     for sr in rows:
+        code_norm = (sr.profile_code or "").strip().upper()
+        if as_text_mode:
+            if code_norm not in allowed_codes:
+                warnings.append(
+                    f"Строка {sr.row_index}: «{sr.profile_code}» не включён в раскрой"
+                )
+                continue
+            kept.append(sr)
+            continue
+
         d = parse_profile_series_digit(sr.profile_code)
         if d is None:
             # Нестандартные профили (например L15, DT20 и т.п.) не отбрасываем:
@@ -66,7 +80,7 @@ def filter_spec_by_profiles(
             )
             kept.append(sr)
             continue
-        if d not in allowed_digits:
+        if d not in allowed_profiles:
             warnings.append(
                 f"Строка {sr.row_index}: «{sr.profile_code}» — "
                 f"{PROFILE_DIGIT_TO_NAME[d]} не включён в раскрой"

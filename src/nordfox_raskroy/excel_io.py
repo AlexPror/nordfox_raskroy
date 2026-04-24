@@ -225,6 +225,50 @@ def parse_specification(path: str | Path) -> list[SpecRow]:
     return rows
 
 
+def parse_project_metadata(path: str | Path) -> tuple[str, str]:
+    """
+    Возвращает (название_проекта, шифр_проекта) из верхней части листа.
+    Ищет пары вида «Название проекта: ...» и «Шифр: ...».
+    """
+    path = Path(path)
+    wb = load_workbook(path, data_only=True)
+    try:
+        ws = wb.active
+        project_name = ""
+        project_cipher = ""
+        for r in range(1, min(ws.max_row, 40) + 1):
+            row_vals: list[str] = []
+            for c in range(1, 13):
+                v = ws.cell(r, c).value
+                row_vals.append("" if v is None else str(v).strip())
+            for i, raw in enumerate(row_vals):
+                if not raw:
+                    continue
+                txt = raw.casefold()
+                next_val = row_vals[i + 1].strip() if i + 1 < len(row_vals) else ""
+                if (("название" in txt and "проект" in txt) or "наименование проекта" in txt) and not project_name:
+                    candidate = ""
+                    if ":" in raw:
+                        candidate = raw.split(":", 1)[1].strip()
+                    if not candidate:
+                        candidate = next_val
+                    if candidate:
+                        project_name = candidate
+                if ("шифр" in txt or "код проекта" in txt) and not project_cipher:
+                    candidate = ""
+                    if ":" in raw:
+                        candidate = raw.split(":", 1)[1].strip()
+                    if not candidate:
+                        candidate = next_val
+                    if candidate:
+                        project_cipher = candidate
+            if project_name and project_cipher:
+                break
+        return project_name, project_cipher
+    finally:
+        wb.close()
+
+
 def write_spec_workbook(path: str | Path, rows: list[tuple]) -> None:
     """Служебная запись тестовой спецификации. rows: список кортежей по колонкам."""
     path = Path(path)

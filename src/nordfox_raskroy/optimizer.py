@@ -13,14 +13,28 @@ from nordfox_raskroy.profile_dimensions import (
 logger = logging.getLogger("nordfox_raskroy.optimizer")
 
 
-def angle_offset_mm(cut_angle: int) -> int:
-    """Технологический отступ на одну сторону подреза: 90° -> 30 мм, иначе 50 мм."""
-    return 30 if int(cut_angle) == 90 else 50
+def angle_offset_mm(
+    cut_angle: int,
+    *,
+    offset_90_mm: int = 30,
+    offset_other_mm: int = 50,
+) -> int:
+    """Технологический отступ на одну сторону подреза."""
+    return int(offset_90_mm) if int(cut_angle) == 90 else int(offset_other_mm)
 
 
-def total_angle_offset_mm(demand: PartDemand) -> int:
+def total_angle_offset_mm(
+    demand: PartDemand,
+    *,
+    offset_90_mm: int = 30,
+    offset_other_mm: int = 50,
+) -> int:
     """Технологический отступ только по первому (левому) углу."""
-    return angle_offset_mm(demand.cut_angle)
+    return angle_offset_mm(
+        demand.cut_angle,
+        offset_90_mm=offset_90_mm,
+        offset_other_mm=offset_other_mm,
+    )
 
 
 def format_cut_angles(demand: PartDemand) -> str:
@@ -30,9 +44,23 @@ def format_cut_angles(demand: PartDemand) -> str:
     return f"{int(demand.cut_angle)}/{int(demand.cut_angle_2)}"
 
 
-def demand_cut_length_mm(demand: PartDemand, kerf_mm: int = 0) -> int:
+def demand_cut_length_mm(
+    demand: PartDemand,
+    kerf_mm: int = 0,
+    *,
+    offset_90_mm: int = 30,
+    offset_other_mm: int = 50,
+) -> int:
     """Полная длина съёма с заготовки для одной детали."""
-    return int(demand.length_mm) + total_angle_offset_mm(demand) + int(kerf_mm) * 2
+    return (
+        int(demand.length_mm)
+        + total_angle_offset_mm(
+            demand,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+        )
+        + int(kerf_mm) * 2
+    )
 
 
 def spec_rows_to_demands(rows: list[SpecRow]) -> list[PartDemand]:
@@ -104,6 +132,8 @@ def optimize_cutting(
     *,
     bar_lengths_mm: list[int],
     kerf_mm: int = 0,
+    offset_90_mm: int = 30,
+    offset_other_mm: int = 50,
     min_scrap_mm: int = 50,
     initial_scraps_mm: Sequence[int] | None = None,
 ) -> OptimizationResult:
@@ -124,13 +154,26 @@ def optimize_cutting(
         min_scrap_mm,
         len(initial_scraps_mm) if initial_scraps_mm else 0,
     )
-    if kerf_mm < 0 or min_scrap_mm < 0:
-        raise ValueError("kerf_mm и min_scrap_mm не могут быть отрицательными")
+    if kerf_mm < 0 or min_scrap_mm < 0 or offset_90_mm < 0 or offset_other_mm < 0:
+        raise ValueError(
+            "kerf_mm, min_scrap_mm и технологические отступы не могут быть отрицательными"
+        )
     bars = sorted(set(bar_lengths_mm))
     if not bars:
         raise ValueError("Не заданы длины заготовок")
 
-    need = max((demand_cut_length_mm(d, kerf_mm) for d in demands), default=0)
+    need = max(
+        (
+            demand_cut_length_mm(
+                d,
+                kerf_mm,
+                offset_90_mm=offset_90_mm,
+                offset_other_mm=offset_other_mm,
+            )
+            for d in demands
+        ),
+        default=0,
+    )
     if need > max(bars):
         raise ValueError(
             "Есть деталь с учетом технологического отступа/пропила длиной "
@@ -139,7 +182,12 @@ def optimize_cutting(
 
     sorted_demands = sorted(
         demands,
-        key=lambda d: demand_cut_length_mm(d, kerf_mm),
+        key=lambda d: demand_cut_length_mm(
+            d,
+            kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+        ),
         reverse=True,
     )
     # (длина мм, stock_opening_id, ключ профиля): 0 — склад до расчёта; новый пруток получает 1, 2, …
@@ -153,8 +201,17 @@ def optimize_cutting(
     next_opening_id = 0
 
     for d in sorted_demands:
-        offset_mm = total_angle_offset_mm(d)
-        cut_len = demand_cut_length_mm(d, kerf_mm)
+        offset_mm = total_angle_offset_mm(
+            d,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+        )
+        cut_len = demand_cut_length_mm(
+            d,
+            kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+        )
         trail_deg = part_trailing_angle_deg(d.cut_angle, d.cut_angle_2)
         scrap_geo_mm = extra_trailing_end_clearance_mm(d.profile_code, trail_deg)
         cut_len_on_scrap = cut_len + scrap_geo_mm

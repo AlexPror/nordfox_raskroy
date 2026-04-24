@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from collections import defaultdict
 import logging
 from pathlib import Path
@@ -18,6 +19,7 @@ try:
         QKeySequence,
         QPainter,
         QPen,
+        QPixmap,
         QPolygonF,
         QRegion,
         QShortcut,
@@ -27,6 +29,7 @@ try:
         QApplication,
         QCheckBox,
         QComboBox,
+        QDialog,
         QFileDialog,
         QGridLayout,
         QGroupBox,
@@ -38,9 +41,11 @@ try:
         QMenu,
         QMessageBox,
         QInputDialog,
+        QProgressDialog,
         QPushButton,
         QPlainTextEdit,
         QScrollArea,
+        QSlider,
         QSizePolicy,
         QSplitter,
         QTableWidget,
@@ -60,9 +65,13 @@ from nordfox_raskroy.bar_scenarios import (
     format_scenario_report,
     pick_recommended,
 )
-from nordfox_raskroy.excel_io import parse_specification, parse_specification_with_stats
+from nordfox_raskroy.excel_io import (
+    parse_project_metadata,
+    parse_specification,
+    parse_specification_with_stats,
+)
 from nordfox_raskroy.export_results import export_cuts_excel, export_cuts_pdf
-from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand
+from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
 from nordfox_raskroy.module_colors import module_row_rgb
 from nordfox_raskroy.optimizer import (
     demand_cut_length_mm,
@@ -73,13 +82,16 @@ from nordfox_raskroy.optimizer import (
 )
 from nordfox_raskroy.result_sort import SORT_MODES, sort_cuts
 from nordfox_raskroy.materials_library import (
+    get_editable_profile_entries,
     kg_per_meter_from_profile_code,
     row_mass_kg_display,
+    save_editable_profile_entries,
     total_mass_kg,
 )
 from nordfox_raskroy.profile_codes import (
     PROFILE_DIGIT_TO_NAME,
     filter_spec_by_profiles,
+    parse_profile_series_digit,
     profile_label_for_code,
 )
 from nordfox_raskroy.scrap_stock_io import parse_scrap_inventory
@@ -92,6 +104,7 @@ _TECH_VIS_FILL = QColor(255, 237, 213)
 _TECH_VIS_LINE = QColor(234, 88, 12)
 _KERF_VIS_FILL = QColor(207, 250, 254)
 _KERF_VIS_LINE = QColor(14, 116, 144)
+_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "nordfox_logo.png"
 
 
 def _reportlab_cyrillic_fonts() -> tuple[str, str]:
@@ -208,15 +221,15 @@ class RingBreakdownWidget(QWidget):
     """Универсальная кольцевая диаграмма с легендой и центром."""
 
     _SEGMENT_COLORS = (
-        QColor(59, 130, 246),
-        QColor(16, 185, 129),
-        QColor(245, 158, 11),
-        QColor(168, 85, 247),
-        QColor(236, 72, 153),
+        QColor(16, 87, 153),
+        QColor(36, 128, 203),
+        QColor(88, 154, 210),
+        QColor(140, 171, 196),
+        QColor(198, 214, 228),
     )
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(220, 170)
+        self.setMinimumSize(220, 210)
         self._segments: list[tuple[str, float, QColor]] = []
         self._legend_lines: list[tuple[str, QColor]] = []
         self._title = "Диаграмма"
@@ -297,14 +310,16 @@ class RingBreakdownWidget(QWidget):
         p.drawText(inner_rect, int(Qt.AlignCenter), f"{self._center_top}\n{self._center_bottom}")
 
         p.setFont(QFont("Segoe UI", 8))
-        y = 54
+        narrow_mode = self.width() < 340
+        x_leg = 12 if narrow_mode else 132
+        y = 162 if narrow_mode else 54
         for text, color in self._legend_lines:
             p.setPen(Qt.NoPen)
             p.setBrush(color)
-            p.drawRect(132, y - 8, 10, 10)
+            p.drawRect(x_leg, y - 8, 10, 10)
             p.setPen(QColor(31, 41, 55))
-            p.drawText(146, y, text)
-            y += 18
+            p.drawText(x_leg + 14, y, text)
+            y += 16
 
 
 class CuttingLayoutWidget(QWidget):
@@ -317,14 +332,18 @@ class CuttingLayoutWidget(QWidget):
         self._rows: list[dict[str, object]] = []
         self._color_map: dict[str, QColor] = {}
         self._zoom = 1.0
+        self._project_name = ""
+        self._project_cipher = ""
         self._overflow_entries: list[dict[str, object]] = []
         self._overflow_index_by_key: dict[tuple[int, int], int] = {}
         self.setMinimumHeight(240)
+        self.setMinimumWidth(1200)
 
     def set_plan(self, rows: list[dict[str, object]], color_map: dict[str, QColor]) -> None:
         self._rows = rows
         self._color_map = color_map
         row_h = int(52 * self._zoom)
+        self.setMinimumWidth(max(1200, int(1200 * self._zoom)))
         self.setMinimumHeight(max(240, 48 + len(rows) * row_h))
         self._rebuild_overflow_index()
         self.update()
@@ -334,14 +353,21 @@ class CuttingLayoutWidget(QWidget):
         self._overflow_entries = []
         self._overflow_index_by_key = {}
         self.overflowLegendChanged.emit([])
+        self.setMinimumWidth(1200)
         self.setMinimumHeight(240)
         self.update()
 
     def set_zoom(self, zoom: float) -> None:
         self._zoom = max(1.0, min(2.0, float(zoom)))
         row_h = int(52 * self._zoom)
+        self.setMinimumWidth(max(1200, int(1200 * self._zoom)))
         self.setMinimumHeight(max(240, 48 + len(self._rows) * row_h))
         self._rebuild_overflow_index()
+        self.update()
+
+    def set_project_meta(self, project_name: str, project_cipher: str) -> None:
+        self._project_name = (project_name or "").strip()
+        self._project_cipher = (project_cipher or "").strip()
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -350,7 +376,9 @@ class CuttingLayoutWidget(QWidget):
 
     def _rebuild_overflow_index(self) -> None:
         z = self._zoom
-        xw = max(400.0, float(self.width() - 180))
+        title_w = 220.0 * z
+        x0 = 16.0 + title_w + 12.0
+        xw = max(320.0, float(self.width() - x0 - 18.0))
         bar_h = 22.0 * z
         min_font = 4
         max_font = max(6, int(round(6 * z)))
@@ -422,13 +450,38 @@ class CuttingLayoutWidget(QWidget):
             p.drawText(16, 28, "Нет данных для схемы раскроя")
             return
 
-        x0 = 160.0
-        xw = max(400.0, float(self.width() - 180))
-        y = 20.0
+        title_w = 220.0 * z
+        card_x = 12.0
+        card_w = max(520.0, float(self.width() - 24.0))
+        x0 = card_x + title_w + 12.0
+        xw = max(320.0, card_w - title_w - 18.0)
+        top_meta = f"Проект: {self._project_name or '—'}   |   Шифр: {self._project_cipher or '—'}"
+        p.setPen(QColor(15, 23, 42))
+        p.setFont(QFont("Segoe UI", max(7, int(round(8 * z))), QFont.Bold))
+        p.drawText(12, int(20 * z), top_meta)
+        p.setFont(QFont("Segoe UI", max(6, int(round(7 * z)))))
+        lx = 12.0
+        ly = 48.0
+        p.setPen(QColor(30, 41, 59))
+        p.drawText(int(lx), int(ly), "Легенда профилей:")
+        lx += 108.0
+        for name in sorted(self._color_map):
+            c = self._color_map[name]
+            p.setPen(QColor(148, 163, 184))
+            p.setBrush(c)
+            p.drawRect(QRectF(lx, ly - 8, 10, 10))
+            p.setPen(QColor(30, 41, 59))
+            p.drawText(int(lx + 14), int(ly), name)
+            lx += max(70.0, 12.0 + (len(name) * 6.0))
+            if lx > self.width() - 160:
+                lx = 120.0
+                ly += 14.0
+        y = ly + 14.0
         bar_h = 22.0 * z
-        row_gap_above_bar = 14.0 * z
-        row_gap_below_bar = 16.0 * z
+        row_gap_above_bar = 10.0 * z
+        row_gap_below_bar = 14.0 * z
         tech_label_h = 11.0 * z
+        card_h = row_gap_above_bar + bar_h + 4.0 * z
         for row in self._rows:
             opening = int(row.get("opening", 0))
             bar_len = int(row.get("bar_len", 0))
@@ -437,24 +490,40 @@ class CuttingLayoutWidget(QWidget):
             if not isinstance(segs, list) or bar_len <= 0:
                 continue
 
-            bar_y = y + row_gap_above_bar
+            card_y = y
+            bar_y = card_y + row_gap_above_bar
 
             p.setPen(QColor(30, 41, 59))
-            p.drawText(12, int(y + 10 * z), f"Пруток {opening} ({bar_len} мм)")
-            oc = opening_row_color(opening)
-            p.setPen(Qt.NoPen)
-            p.setBrush(oc)
-            p.drawRect(QRectF(8, bar_y + 1, 3, bar_h - 2))
-            scrap_marks = {
-                str(seg.get("origin", ""))
-                for seg in segs
-                if isinstance(seg, dict) and str(seg.get("kind", "")) == "profile" and bool(seg.get("is_scrap"))
-            }
-            if scrap_marks:
-                p.setPen(QColor(71, 85, 105))
-                p.setFont(QFont("Segoe UI", max(5, int(round(6 * z)))))
-                p.drawText(12, int(bar_y + bar_h + 4 * z), "Обрезки: " + ", ".join(sorted(scrap_marks)))
-
+            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            row_profiles = sorted(
+                {
+                    str(seg.get("profile_name", ""))
+                    for seg in segs
+                    if isinstance(seg, dict) and str(seg.get("kind", "")) == "profile"
+                }
+            )
+            profile_txt = ", ".join([x for x in row_profiles if x][:2])
+            if len(row_profiles) > 2:
+                profile_txt += ", ..."
+            title = f"Пруток {opening} ({bar_len} мм)"
+            if profile_txt:
+                title += f" - {profile_txt}"
+            # Карточка строки: левый блок подписи + правый блок схемы прутка.
+            p.setPen(QPen(QColor(148, 163, 184), 1.0))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawRect(QRectF(card_x, card_y, card_w, card_h))
+            p.setPen(QPen(QColor(203, 213, 225), 1.0))
+            p.drawLine(
+                QPointF(card_x + title_w + 6.0, card_y),
+                QPointF(card_x + title_w + 6.0, card_y + card_h),
+            )
+            p.setPen(QColor(30, 41, 59))
+            p.setFont(QFont("Segoe UI", max(7, int(round(8 * z))), QFont.Bold))
+            p.drawText(
+                QRectF(card_x + 8.0, card_y + 2.0, title_w - 10.0, card_h - 4.0),
+                int(Qt.AlignLeft | Qt.AlignVCenter | Qt.TextFlag.TextWordWrap),
+                title,
+            )
             p.setPen(QPen(QColor(148, 163, 184), 1.0))
             p.setBrush(QColor(255, 255, 255))
             p.drawRect(QRectF(x0, bar_y, xw, bar_h))
@@ -497,11 +566,19 @@ class CuttingLayoutWidget(QWidget):
                     p.setPen(QPen(_TECH_VIS_LINE, 1.0))
                     p.setBrush(Qt.NoBrush)
                     p.drawRect(tech_rect)
-                    p.setPen(_TECH_VIS_LINE)
-                    p.setFont(QFont("Segoe UI", max(6, int(round(7 * z))), QFont.Bold))
+                    # Подпись техотступа рендерим в компактном бейдже над сегментом,
+                    # чтобы не налезала на рамку и оставалась читаемой даже для 30 мм.
+                    badge_w = max(12.0 * z, sw + 4.0 * z)
+                    badge_x = sx + (sw - badge_w) / 2.0
+                    badge_y = bar_y - tech_label_h - 3.0 * z
+                    p.setPen(QPen(_TECH_VIS_LINE, 0.9))
+                    p.setBrush(QColor(255, 247, 237))
+                    p.drawRoundedRect(QRectF(badge_x, badge_y, badge_w, tech_label_h), 2.0, 2.0)
+                    p.setPen(_TECH_VIS_LINE.darker(120))
+                    p.setFont(QFont("Segoe UI", max(5, int(round(6 * z))), QFont.Bold))
                     p.drawText(
-                        QRectF(sx, bar_y - tech_label_h - 1, sw, tech_label_h),
-                        int(Qt.AlignHCenter | Qt.AlignBottom),
+                        QRectF(badge_x, badge_y, badge_w, tech_label_h),
+                        int(Qt.AlignCenter),
                         f"{tech_show}",
                     )
                 elif kind == "kerf":
@@ -614,7 +691,7 @@ class CuttingLayoutWidget(QWidget):
                     int(Qt.AlignCenter),
                     f"остаток {remainder}",
                 )
-            y += row_gap_above_bar + bar_h + row_gap_below_bar
+            y += card_h + row_gap_below_bar
 
 
 class JointAlbumWidget(QWidget):
@@ -629,7 +706,8 @@ class JointAlbumWidget(QWidget):
     def set_rows(self, rows: list[dict[str, object]], color_map: dict[str, QColor]) -> None:
         self._rows = rows
         self._color_map = color_map
-        self.setMinimumHeight(max(280, 24 + len(rows) * 126))
+        row_h = 86
+        self.setMinimumHeight(max(260, 28 + len(rows) * row_h))
         self.setMinimumWidth(720)
         self.updateGeometry()
         self.update()
@@ -649,11 +727,23 @@ class JointAlbumWidget(QWidget):
             p.drawText(14, 28, "Нет данных для альбома стыков")
             return
 
-        y = 12.0
-        row_h = 116.0
-        left_x = 140.0
-        detail_w = max(180.0, (self.width() - 220.0) / 2.0)
-        detail_h = 56.0
+        y = 32.0
+        row_h = 76.0
+        caption_w = 260.0
+        detail_h = 34.0
+        p.setPen(QColor(30, 41, 59))
+        p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        p.drawText(14, 20, "Легенда цветов профилей:")
+        lx = 190.0
+        p.setFont(QFont("Segoe UI", 8))
+        for name in sorted(self._color_map):
+            c = self._color_map[name]
+            p.setPen(QColor(148, 163, 184))
+            p.setBrush(c)
+            p.drawRect(QRectF(lx, 12, 10, 10))
+            p.setPen(QColor(30, 41, 59))
+            p.drawText(int(lx + 14), 21, name)
+            lx += 78.0
 
         def _draw_detail(
             rect: QRectF,
@@ -693,11 +783,19 @@ class JointAlbumWidget(QWidget):
             p.setPen(QPen(_TECH_VIS_LINE, 1.0))
             p.setBrush(Qt.NoBrush)
             p.drawRect(tech_rect)
-            p.setPen(_TECH_VIS_LINE)
-            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            # Бейдж техотступа как в схеме раскроя: красная скругленная рамка с числом.
+            badge_w = max(18.0, tech_rect.width() + 6.0)
+            badge_h = 12.0
+            badge_x = tech_rect.center().x() - (badge_w / 2.0)
+            badge_y = yt - 16.0
+            p.setPen(QPen(_TECH_VIS_LINE, 1.0))
+            p.setBrush(QColor(255, 247, 237))
+            p.drawRoundedRect(QRectF(badge_x, badge_y, badge_w, badge_h), 3, 3)
+            p.setPen(_TECH_VIS_LINE.darker(120))
+            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
             p.drawText(
-                QRectF(tech_rect.left(), yt - 16, tech_rect.width(), 14),
-                int(Qt.AlignHCenter | Qt.AlignBottom),
+                QRectF(badge_x, badge_y, badge_w, badge_h),
+                int(Qt.AlignCenter),
                 str(int(tech_mm)),
             )
 
@@ -740,18 +838,31 @@ class JointAlbumWidget(QWidget):
 
             p.setPen(QColor(15, 23, 42))
             p.setFont(QFont("Segoe UI", 8))
-            fm = QFontMetrics(p.font())
             p.drawText(
                 body.adjusted(4, 2, -4, -2),
-                int(Qt.AlignCenter),
-                fm.elidedText(title, Qt.TextElideMode.ElideRight, int(body.width() - 8)),
+                int(Qt.AlignCenter | Qt.TextWordWrap),
+                title,
             )
 
+            # Углы внутри рисунка: слева/справа внизу, как в схеме раскроя.
             p.setPen(QColor(51, 65, 85))
-            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
-            p.drawText(int(rect.left() + 2), int(rect.bottom() + 16), f"L: {left_angle_deg}°")
-            p.drawText(int(rect.right() - 56), int(rect.bottom() + 16), f"R: {right_angle_deg}°")
+            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            angle_y = body.bottom() - 11.0
+            left_box = QRectF(body.left() + 1.5, angle_y, max(body.width() * 0.48 - 3.0, 12.0), 9.0)
+            right_box = QRectF(body.left() + body.width() * 0.52, angle_y, max(body.width() * 0.48 - 3.0, 12.0), 9.0)
+            p.drawText(
+                left_box,
+                int(Qt.AlignLeft | Qt.AlignVCenter),
+                f"L{left_angle_deg}°",
+            )
+            p.drawText(
+                right_box,
+                int(Qt.AlignRight | Qt.AlignVCenter),
+                f"R{right_angle_deg}°",
+            )
 
+        joint_no = 0
+        detail_no = 0
         for r in self._rows:
             opening = int(r.get("opening", 0))
             kind = str(r.get("kind", "joint"))
@@ -768,30 +879,155 @@ class JointAlbumWidget(QWidget):
             p.setPen(QPen(QColor(203, 213, 225), 1.0))
             p.setBrush(QColor(255, 255, 255))
             p.drawRoundedRect(block, 6, 6)
+            # Отдельный левый блок подписи.
+            caption_rect = QRectF(block.left() + 4, y + 4, caption_w, block.height() - 8)
+            p.setPen(QPen(QColor(203, 213, 225), 1.0))
+            p.setBrush(QColor(248, 250, 252))
+            p.drawRoundedRect(caption_rect, 4, 4)
             p.setPen(QColor(30, 41, 59))
-            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            profile_caption = left_profile if left_profile == right_profile else f"{left_profile}/{right_profile}"
+            if kind == "detail":
+                detail_no += 1
+                row_caption = f"Пруток {opening}, {profile_caption}: деталь #{detail_no}"
+            else:
+                joint_no += 1
+                row_caption = f"Пруток {opening}, {profile_caption}: стык #{joint_no}"
             p.drawText(
-                16,
-                int(y + 18),
-                f"Пруток {opening}: {'стык' if kind == 'joint' else 'деталь'}",
+                caption_rect.adjusted(8, 4, -8, -4),
+                int(Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap),
+                row_caption,
             )
 
-            ly = y + 36.0
-            left_rect = QRectF(left_x, ly, detail_w, detail_h)
-            seam_x = left_rect.right()
-            right_rect = QRectF(seam_x, ly, detail_w, detail_h)
+            # Правый блок с рисунком (в той же строке).
+            drawing_rect = QRectF(
+                caption_rect.right() + 6,
+                block.top() + 4,
+                block.right() - (caption_rect.right() + 10),
+                block.height() - 8,
+            )
+            p.setPen(QPen(QColor(226, 232, 240), 1.0))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawRoundedRect(drawing_rect, 4, 4)
+
+            local_detail_w = max(170.0, (drawing_rect.width() - 16.0) / 2.0)
+            ly = drawing_rect.top() + max(4.0, (drawing_rect.height() - detail_h) / 2.0)
+            if kind == "detail":
+                left_rect = QRectF(
+                    drawing_rect.left() + (drawing_rect.width() - local_detail_w) / 2.0,
+                    ly,
+                    local_detail_w,
+                    detail_h,
+                )
+                seam_x = left_rect.right()
+                right_rect = QRectF(0, 0, 0, 0)
+            else:
+                left_rect = QRectF(drawing_rect.left() + 4.0, ly, local_detail_w, detail_h)
+                seam_x = left_rect.right()
+                right_rect = QRectF(seam_x, ly, local_detail_w, detail_h)
             left_tech = int(r.get("left_tech_mm", 30))
             right_tech = int(r.get("right_tech_mm", 30))
             kerf_mm = int(r.get("kerf_mm", 4))
 
             lc = self._color_map.get(left_profile, QColor(147, 197, 253))
             rc = self._color_map.get(right_profile, QColor(134, 239, 172))
+            left_detail_no = detail_no
+            if kind != "detail":
+                left_detail_no += 1
             _draw_detail(left_rect, lc, left_title, left_left_angle, left_angle, left_tech, kerf_mm)
-            _draw_detail(right_rect, rc, right_title, right_angle, right_right_angle, right_tech, kerf_mm)
-
-            p.setPen(QPen(QColor(15, 23, 42), 1.2, Qt.PenStyle.DashLine))
-            p.drawLine(QPointF(seam_x, ly - 3), QPointF(seam_x, ly + detail_h + 3))
+            if kind != "detail":
+                right_detail_no = left_detail_no + 1
+                _draw_detail(
+                    right_rect,
+                    rc,
+                    right_title,
+                    right_angle,
+                    right_right_angle,
+                    right_tech,
+                    kerf_mm,
+                )
+                detail_no = right_detail_no
+                p.setPen(QPen(QColor(15, 23, 42), 1.2, Qt.PenStyle.DashLine))
+                p.drawLine(QPointF(seam_x, ly - 3), QPointF(seam_x, ly + detail_h + 3))
             y += row_h + 10.0
+
+
+class ProfileLibraryDialog(QDialog):
+    def __init__(self, parent: QWidget, rows: list[tuple[str, float]]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Таблица профилей")
+        self.resize(760, 520)
+        lay = QVBoxLayout(self)
+        self.table = QTableWidget()
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(["Профиль", "Масса, кг/м"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        lay.addWidget(self.table, 1)
+        for name, kg in rows:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QTableWidgetItem(name))
+            self.table.setItem(r, 1, QTableWidgetItem(f"{kg:.3f}".rstrip("0").rstrip(".")))
+        btns = QHBoxLayout()
+        b_add = QPushButton("Добавить")
+        b_add.clicked.connect(self._add_row)
+        btns.addWidget(b_add)
+        b_del = QPushButton("Удалить")
+        b_del.clicked.connect(self._remove_selected)
+        btns.addWidget(b_del)
+        btns.addStretch(1)
+        b_save = QPushButton("Сохранить")
+        b_save.clicked.connect(self._save)
+        btns.addWidget(b_save)
+        b_cancel = QPushButton("Закрыть")
+        b_cancel.clicked.connect(self.reject)
+        btns.addWidget(b_cancel)
+        lay.addLayout(btns)
+        self.result_rows: list[tuple[str, float]] = []
+
+    def _add_row(self) -> None:
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem("Новый профиль"))
+        self.table.setItem(r, 1, QTableWidgetItem("0.0"))
+        self.table.setCurrentCell(r, 0)
+
+    def _remove_selected(self) -> None:
+        ranges = self.table.selectedRanges()
+        if not ranges:
+            return
+        for rr in range(ranges[0].bottomRow(), ranges[0].topRow() - 1, -1):
+            self.table.removeRow(rr)
+
+    def _save(self) -> None:
+        out: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for r in range(self.table.rowCount()):
+            it_name = self.table.item(r, 0)
+            it_kg = self.table.item(r, 1)
+            name = (it_name.text().strip() if it_name else "").strip()
+            if not name:
+                continue
+            try:
+                kg = float((it_kg.text() if it_kg else "0").replace(",", "."))
+            except ValueError:
+                QMessageBox.warning(self, "Таблица профилей", f"Строка {r + 1}: некорректная масса")
+                return
+            if kg <= 0:
+                QMessageBox.warning(self, "Таблица профилей", f"Строка {r + 1}: масса должна быть > 0")
+                return
+            key = name.casefold()
+            if key in seen:
+                QMessageBox.warning(self, "Таблица профилей", f"Дубликат профиля: {name}")
+                return
+            seen.add(key)
+            out.append((name, kg))
+        if not out:
+            QMessageBox.warning(self, "Таблица профилей", "Нужно оставить хотя бы один профиль.")
+            return
+        self.result_rows = out
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -803,7 +1039,7 @@ class MainWindow(QMainWindow):
             """
             QWidget { background: #f8fafc; color: #0f172a; }
             QGroupBox {
-                border: 1px solid #dbe3ee;
+                border: 1px solid #d7e2ee;
                 border-radius: 10px;
                 margin-top: 10px;
                 padding-top: 8px;
@@ -817,12 +1053,13 @@ class MainWindow(QMainWindow):
                 padding: 4px;
             }
             QPushButton {
-                background: #ffffff;
-                border: 1px solid #cfd8e3;
+                background: #eef4fb;
+                border: 1px solid #c2d4e8;
                 border-radius: 8px;
-                padding: 6px 10px;
+                padding: 8px 14px;
+                min-height: 34px;
             }
-            QPushButton:hover { background: #f1f5f9; }
+            QPushButton:hover { background: #dfeaf8; }
             """
         )
 
@@ -834,11 +1071,18 @@ class MainWindow(QMainWindow):
         self._data_row_count: int = 0
         self._selected_bars_mm: tuple[int, ...] | None = None
         self._last_kerf_mm: int = 0
+        self._last_offset_90_mm: int = 30
+        self._last_offset_other_mm: int = 50
+        self._project_name: str = ""
+        self._project_cipher: str = ""
         self._layout_rows: list[dict[str, object]] = []
         self._album_rows: list[dict[str, object]] = []
         self._table_zoom = 1.0
         self._layout_zoom = 1.0
         self.log_emitter = LogEmitter()
+        self._live_log_lines: list[str] = []
+        self._log_dialog: QDialog | None = None
+        self._log_dialog_view: QPlainTextEdit | None = None
         logger.info("MainWindow init")
 
         root = QWidget()
@@ -846,50 +1090,76 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, 1)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(self.main_splitter, 1)
 
         left_wrap = QWidget()
         left_wrap.setMinimumWidth(280)
-        left_wrap.setMaximumWidth(420)
         left_wrap.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         left_layout = QVBoxLayout(left_wrap)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setWidget(left_wrap)
+        self._left_panel_fixed_width = 760
+        left_scroll.setMinimumWidth(self._left_panel_fixed_width)
+        left_scroll.setMaximumWidth(self._left_panel_fixed_width)
 
         right_wrap = QWidget()
         right_layout = QVBoxLayout(right_wrap)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
 
-        logs_wrap = QWidget()
-        logs_wrap.setMinimumWidth(260)
-        logs_layout = QVBoxLayout(logs_wrap)
-        logs_layout.setContentsMargins(0, 0, 0, 0)
-        logs_layout.setSpacing(6)
+        self.main_splitter.addWidget(left_scroll)
+        self.main_splitter.addWidget(right_wrap)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setSizes([self._left_panel_fixed_width, 780])
 
-        splitter.addWidget(left_wrap)
-        splitter.addWidget(right_wrap)
-        splitter.addWidget(logs_wrap)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 6)
-        splitter.setStretchFactor(2, 2)
-        splitter.setChildrenCollapsible(False)
-        splitter.setSizes([320, 980, 360])
-
+        menu_view = self.menuBar().addMenu("Логи")
+        act_logs = QAction("Логи", self)
+        act_logs.triggered.connect(self._show_logs_dialog)
+        menu_view.addAction(act_logs)
+        menu_profiles = self.menuBar().addMenu("Таблица профилей")
+        act_profiles = QAction("Открыть таблицу профилей", self)
+        act_profiles.triggered.connect(self._show_profiles_dialog)
+        menu_profiles.addAction(act_profiles)
         top = QHBoxLayout()
         left_layout.addLayout(top)
         top.addWidget(QLabel("Спецификация (.xlsx):"))
         self.path_edit = QLineEdit()
         self.path_edit.setMinimumWidth(120)
         self._bind_line_edit_undo_redo(self.path_edit)
+        self.path_edit.editingFinished.connect(self._refresh_filters_from_path)
         top.addWidget(self.path_edit, stretch=1)
         browse = QPushButton("Обзор…")
         browse.clicked.connect(self._browse)
         top.addWidget(browse)
+        top.addStretch(1)
+        self.logo_label = QLabel()
+        self.logo_caption = QLabel("РАСКРОЙ")
+        self.logo_caption.setStyleSheet("color: #105799; font-weight: 700;")
+        self.logo_caption.setFont(QFont("Segoe UI", 13, QFont.Bold, italic=True))
+        if _LOGO_PATH.is_file():
+            px = QPixmap(str(_LOGO_PATH))
+            if not px.isNull():
+                self.logo_label.setPixmap(
+                    px.scaledToWidth(150, Qt.TransformationMode.SmoothTransformation)
+                )
+        logo_wrap = QWidget()
+        logo_l = QVBoxLayout(logo_wrap)
+        logo_l.setContentsMargins(6, 0, 0, 0)
+        logo_l.setSpacing(0)
+        logo_l.addWidget(self.logo_label)
+        logo_l.addWidget(self.logo_caption)
+        # Дублируем в рабочей шапке: на некоторых стилях cornerWidget меню не виден.
+        top.addWidget(logo_wrap)
 
         scrap_row = QHBoxLayout()
         left_layout.addLayout(scrap_row)
@@ -906,16 +1176,34 @@ class MainWindow(QMainWindow):
             "Профили в раскрое (СК-/СС-/Р-: 0=Н20, 1=Н21, 2=Н22, 3=Н23)"
         )
         prof.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        prof.setMaximumHeight(130)
         pg = QGridLayout(prof)
         pg.setHorizontalSpacing(10)
         pg.setVerticalSpacing(4)
-        self.profile_checks: dict[int, QCheckBox] = {}
-        for i, name in PROFILE_DIGIT_TO_NAME.items():
-            cb = QCheckBox(f"{name} (цифра {i})")
-            cb.setChecked(True)
-            self.profile_checks[i] = cb
-            pg.addWidget(cb, i // 4, i % 4)
+        pg.addWidget(QLabel("Режим:"), 0, 0, 1, 1)
+        self.profile_mode_combo = QComboBox()
+        self.profile_mode_combo.addItem("Все профили из спецификации", "all_from_spec")
+        self.profile_mode_combo.addItem("Выбрать вручную", "manual")
+        self.profile_mode_combo.currentIndexChanged.connect(self._on_profile_mode_changed)
+        pg.addWidget(self.profile_mode_combo, 0, 1, 1, 3)
+        self.chk_select_all = QCheckBox("Выбрать все")
+        self.chk_select_all.toggled.connect(self._on_select_all_toggled)
+        pg.addWidget(self.chk_select_all, 1, 1, 1, 1)
+        self.chk_clear_all = QCheckBox("Снять все")
+        self.chk_clear_all.toggled.connect(self._on_clear_all_toggled)
+        pg.addWidget(self.chk_clear_all, 1, 2, 1, 1)
+        pg.addWidget(QLabel("Модули:"), 2, 0, 1, 1)
+        self.module_checks: dict[str, QCheckBox] = {}
+        self._module_checks_grid = pg
+        self.profile_checks: dict[str, QCheckBox] = {}
+        self._profile_checks_grid = pg
+        self._syncing_filter_checks = False
+        self._module_check_widgets: list[QCheckBox] = []
+        self._profile_check_widgets: list[QCheckBox] = []
+        self._module_rows_count = 0
+        self._profiles_label = QLabel("Профили:")
+        self._profile_checks_grid.addWidget(self._profiles_label, 3, 0, 1, 1)
+        self._set_module_checkboxes([])
+        self._set_profile_checkboxes(sorted(PROFILE_DIGIT_TO_NAME.values()))
         left_layout.addWidget(prof)
 
         bar_fr = QGroupBox("Длина заготовки (мм)")
@@ -937,67 +1225,90 @@ class MainWindow(QMainWindow):
         bar_row.addWidget(self.base_bar_edit)
         bar_row.addStretch(1)
         left_layout.addWidget(bar_fr)
+        mode_fr = QGroupBox("Режим подбора оптимальной длины")
+        mode_fr.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        mode_l = QVBoxLayout(mode_fr)
+        mode_l.setSpacing(4)
+        mode_row = QHBoxLayout()
+        mode_l.addLayout(mode_row)
+        mode_row.addWidget(QLabel("Точная"))
+        self.length_mode_slider = QSlider(Qt.Orientation.Horizontal)
+        self.length_mode_slider.setRange(0, 1)
+        self.length_mode_slider.setValue(1)
+        self.length_mode_slider.setFixedWidth(120)
+        self.length_mode_slider.setToolTip(
+            "0 — точный подбор (шаг 1 мм), 1 — стандартные длины (кратно 50 мм)."
+        )
+        self.length_mode_slider.valueChanged.connect(self._on_length_mode_changed)
+        mode_row.addWidget(self.length_mode_slider)
+        mode_row.addWidget(QLabel("Стандарт 50 мм"))
+        mode_row.addStretch(1)
+        self.length_mode_badge = QLabel("")
+        self.length_mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.length_mode_badge.setMinimumHeight(24)
+        mode_l.addWidget(self.length_mode_badge)
+        left_layout.addWidget(mode_fr)
 
-        opt = QHBoxLayout()
-        left_layout.addLayout(opt)
-        opt.addWidget(QLabel("Пропил (kerf), мм:"))
+        opt_fr = QGroupBox("Технологические параметры")
+        opt_fr.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        opt_grid = QGridLayout(opt_fr)
+        opt_grid.setHorizontalSpacing(8)
+        opt_grid.setVerticalSpacing(6)
+        opt_grid.addWidget(QLabel("Ширина пропила, мм:"), 0, 0)
         self.kerf_edit = QLineEdit("0")
         self.kerf_edit.setMaximumWidth(72)
         self._bind_line_edit_undo_redo(self.kerf_edit)
-        opt.addWidget(self.kerf_edit)
-        opt.addStretch()
-        tech_rule = QLabel("Тех. отступ: по 1-му углу (90°=30 мм, иначе 50 мм), пропил = 2×kerf")
+        opt_grid.addWidget(self.kerf_edit, 0, 1)
+        opt_grid.addWidget(QLabel("Тех. отступ 90°, мм:"), 0, 2)
+        self.tech_90_edit = QLineEdit("30")
+        self.tech_90_edit.setMaximumWidth(72)
+        self._bind_line_edit_undo_redo(self.tech_90_edit)
+        opt_grid.addWidget(self.tech_90_edit, 0, 3)
+        opt_grid.addWidget(QLabel("Тех. отступ прочие углы, мм:"), 1, 0, 1, 2)
+        self.tech_other_edit = QLineEdit("50")
+        self.tech_other_edit.setMaximumWidth(72)
+        self._bind_line_edit_undo_redo(self.tech_other_edit)
+        opt_grid.addWidget(self.tech_other_edit, 1, 2)
+        left_layout.addWidget(opt_fr)
+        tech_rule = QLabel("Тех. отступ берется по 1-му углу детали, ширина пропила учитывается как 2xпропил.")
         tech_rule.setStyleSheet("color: #475569;")
         tech_rule.setWordWrap(True)
-        tech_rule.setToolTip(
-            "Отступ берётся только по первому углу (90°=30 мм, иначе 50 мм). "
-            "Пропил учитывается как 2×kerf на деталь."
-        )
         left_layout.addWidget(tech_rule)
 
-        btn_row = QHBoxLayout()
-        left_layout.addLayout(btn_row)
-        run_btn = QPushButton("Рассчитать раскрой")
-        run_btn.clicked.connect(self._compute)
-        btn_row.addWidget(run_btn, 1)
-        self.btn_xlsx = QPushButton("Экспорт Excel…")
-        self.btn_xlsx.clicked.connect(self._export_excel)
-        self.btn_xlsx.setEnabled(False)
-        btn_row.addWidget(self.btn_xlsx, 1)
-        self.btn_pdf = QPushButton("Экспорт PDF…")
-        self.btn_pdf.clicked.connect(self._export_pdf)
-        self.btn_pdf.setEnabled(False)
-        btn_row.addWidget(self.btn_pdf, 1)
-
-        btn_row2 = QHBoxLayout()
-        left_layout.addLayout(btn_row2)
-        self.btn_recalc = QPushButton("Пересчитать по таблице")
+        calc_row = QHBoxLayout()
+        left_layout.addLayout(calc_row)
+        run_btn = QPushButton("Рассчитать раскрой под длину в наличии")
+        run_btn.clicked.connect(
+            lambda _=False: self._run_with_loader("Расчет раскроя...", self._compute)
+        )
+        calc_row.addWidget(run_btn, 1)
+        self.btn_recalc = QPushButton("Пересчитать раскрой по таблице")
         self.btn_recalc.setToolTip(
             "Учитываются колонки: модуль, тип профиля, длина, угол. "
             "Колонка «Масса» только для отображения. Остальные после пересчёта обновятся."
         )
-        self.btn_recalc.clicked.connect(self._recalc_from_table)
+        self.btn_recalc.clicked.connect(
+            lambda _=False: self._run_with_loader("Пересчет...", self._recalc_from_table)
+        )
         self.btn_recalc.setEnabled(False)
-        btn_row2.addWidget(self.btn_recalc, 1)
-        btn_adv = QPushButton("Подбор заготовок")
+        calc_row.addWidget(self.btn_recalc, 1)
+        btn_adv = QPushButton("Подобрать оптимальную длину заготовки")
         btn_adv.setToolTip(
             "Сравнивает типовые наборы длин (только 6 м, только 7,5 м, комбинации…); "
             "учитывает склад обрезков, если указан файл."
         )
-        btn_adv.clicked.connect(self._run_bar_advisor)
-        btn_row2.addWidget(btn_adv, 1)
-        btn_apply_rec = QPushButton("Отметить рекоменд. длины")
-        btn_apply_rec.setToolTip("Ставит галочки по последней рекомендации из блока ниже")
-        btn_apply_rec.clicked.connect(self._apply_recommended_bars)
-        btn_row2.addWidget(btn_apply_rec, 1)
+        btn_adv.clicked.connect(
+            lambda _=False: self._run_with_loader("Подбор оптимальной длины...", self._run_bar_advisor)
+        )
+        calc_row.addWidget(btn_adv, 1)
 
         chart_row = QHBoxLayout()
         left_layout.addLayout(chart_row)
         self.mass_chart = RingBreakdownWidget()
-        self.mass_chart.setMaximumHeight(180)
+        self.mass_chart.setMinimumHeight(210)
         chart_row.addWidget(self.mass_chart, 1)
         self.waste_chart = RingBreakdownWidget()
-        self.waste_chart.setMaximumHeight(180)
+        self.waste_chart.setMinimumHeight(210)
         chart_row.addWidget(self.waste_chart, 1)
 
         self.advisor_text = QTextEdit()
@@ -1012,7 +1323,7 @@ class MainWindow(QMainWindow):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         self.advisor_text.setPlaceholderText(
-            "Нажмите «Подбор заготовок» для сравнения вариантов 6 / 7,5 / 12 м по текущей спецификации."
+            "Нажмите «Подобрать оптимальную длину заготовки» для сравнения вариантов 6 / 7,5 / 12 м."
         )
         self.advisor_text.setFont(QFont("Segoe UI", 9))
         left_layout.addWidget(self.advisor_text, stretch=1)
@@ -1032,6 +1343,18 @@ class MainWindow(QMainWindow):
             self.sort_combo.addItem(label, mode_id)
         self.sort_combo.currentIndexChanged.connect(self._apply_sort)
         sort_row.addWidget(self.sort_combo, stretch=1)
+        self.btn_xlsx = QPushButton("Экспорт Excel…")
+        self.btn_xlsx.clicked.connect(
+            lambda _=False: self._run_with_loader("Экспорт Excel...", self._export_excel)
+        )
+        self.btn_xlsx.setEnabled(False)
+        sort_row.addWidget(self.btn_xlsx)
+        self.btn_pdf = QPushButton("Экспорт PDF…")
+        self.btn_pdf.clicked.connect(
+            lambda _=False: self._run_with_loader("Экспорт PDF...", self._export_pdf)
+        )
+        self.btn_pdf.setEnabled(False)
+        sort_row.addWidget(self.btn_pdf)
 
         self.table = QTableWidget()
         self.table.setColumnCount(10)
@@ -1079,11 +1402,15 @@ class MainWindow(QMainWindow):
         layout_tab_l.addLayout(plan_btns)
         self.btn_layout_xlsx = QPushButton("Экспорт схемы Excel…")
         self.btn_layout_xlsx.setEnabled(False)
-        self.btn_layout_xlsx.clicked.connect(self._export_layout_excel)
+        self.btn_layout_xlsx.clicked.connect(
+            lambda _=False: self._run_with_loader("Экспорт схемы Excel...", self._export_layout_excel)
+        )
         plan_btns.addWidget(self.btn_layout_xlsx)
         self.btn_layout_pdf = QPushButton("Экспорт схемы PDF…")
         self.btn_layout_pdf.setEnabled(False)
-        self.btn_layout_pdf.clicked.connect(self._export_layout_pdf)
+        self.btn_layout_pdf.clicked.connect(
+            lambda _=False: self._run_with_loader("Экспорт схемы PDF...", self._export_layout_pdf)
+        )
         plan_btns.addWidget(self.btn_layout_pdf)
         plan_btns.addStretch(1)
         self.layout_hint = QLabel(
@@ -1091,11 +1418,15 @@ class MainWindow(QMainWindow):
             "Углы только подписью (L/R). Пунктир: деталь из обрезка. Узкие сегменты — метки #N в таблице ниже."
         )
         self.layout_hint.setStyleSheet("color: #475569;")
+        self.layout_project_label = QLabel("Проект: —   |   Шифр: —")
+        self.layout_project_label.setStyleSheet("color: #1e293b; font-weight: 600; margin-bottom: 4px;")
+        layout_tab_l.addWidget(self.layout_project_label)
         layout_tab_l.addWidget(self.layout_hint)
         self.layout_widget = CuttingLayoutWidget()
         self.layout_widget.overflowLegendChanged.connect(self._populate_layout_overflow_table)
         self.layout_scroll = QScrollArea()
-        self.layout_scroll.setWidgetResizable(True)
+        self.layout_scroll.setWidgetResizable(False)
+        self.layout_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.layout_scroll.setWidget(self.layout_widget)
         self.layout_scroll.viewport().installEventFilter(self)
         self.layout_widget.installEventFilter(self)
@@ -1127,11 +1458,17 @@ class MainWindow(QMainWindow):
         self.album_mode_combo = QComboBox()
         self.album_mode_combo.addItem("Стыки", "joints")
         self.album_mode_combo.addItem("Детали", "details")
+        self.album_mode_combo.setToolTip(
+            "Стыки: соседние детали в месте стыка.\n"
+            "Детали: контрольная карточка каждой отдельной детали с ее углами, техотступом и пропилом."
+        )
         self.album_mode_combo.currentIndexChanged.connect(self._refresh_album)
         album_btns.addWidget(self.album_mode_combo)
         self.btn_album_pdf = QPushButton("Экспорт альбома PDF…")
         self.btn_album_pdf.setEnabled(False)
-        self.btn_album_pdf.clicked.connect(self._export_album_pdf)
+        self.btn_album_pdf.clicked.connect(
+            lambda _=False: self._run_with_loader("Экспорт альбома PDF...", self._export_album_pdf)
+        )
         album_btns.addWidget(self.btn_album_pdf)
         album_btns.addStretch(1)
         album_hint = QLabel(
@@ -1151,25 +1488,11 @@ class MainWindow(QMainWindow):
         self._copy_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._copy_shortcut.activated.connect(self._copy_from_focused_widget)
 
-        logs_layout.addWidget(QLabel("Логи в реальном времени"))
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.log_view.setFont(QFont("Consolas", 9))
-        self.log_view.setPlaceholderText("Логи расчётов и ошибок появятся здесь…")
-        logs_layout.addWidget(self.log_view, 1)
-        logs_btn_row = QHBoxLayout()
-        self.btn_save_log = QPushButton("Сохранить лог")
-        self.btn_save_log.clicked.connect(self._save_live_log)
-        logs_btn_row.addWidget(self.btn_save_log)
-        self.btn_clear_log = QPushButton("Очистить лог")
-        self.btn_clear_log.clicked.connect(self._clear_live_log)
-        logs_btn_row.addWidget(self.btn_clear_log)
-        logs_layout.addLayout(logs_btn_row)
-
         self._setup_live_log_handler()
         self._enable_text_copy(self.advisor_text)
-        self._enable_text_copy(self.log_view)
+        self._on_profile_mode_changed()
+        self._on_length_mode_changed(int(self.length_mode_slider.value()))
+        self._refresh_project_caption()
 
         proj_root = Path(__file__).resolve().parents[2]
         for name in (
@@ -1180,6 +1503,7 @@ class MainWindow(QMainWindow):
             p = proj_root / "test" / name
             if p.is_file():
                 self.path_edit.setText(str(p))
+                self._refresh_filters_from_path()
                 break
 
     def _browse(self) -> None:
@@ -1192,6 +1516,7 @@ class MainWindow(QMainWindow):
         )
         if p:
             self.path_edit.setText(p)
+            self._refresh_filters_from_path()
 
     def _setup_live_log_handler(self) -> None:
         self.log_emitter.message.connect(self._append_live_log)
@@ -1220,6 +1545,289 @@ class MainWindow(QMainWindow):
         rs.setContext(Qt.ShortcutContext.WidgetShortcut)
         rs.activated.connect(line_edit.redo)
 
+    @contextmanager
+    def _loader(self, text: str):
+        dlg = QProgressDialog(text, "", 0, 0, self)
+        dlg.setWindowTitle("Подождите")
+        dlg.setCancelButton(None)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.show()
+        QApplication.processEvents()
+        try:
+            yield
+        finally:
+            dlg.close()
+            QApplication.processEvents()
+
+    def _run_with_loader(self, text: str, fn) -> None:
+        with self._loader(text):
+            fn()
+
+    def _on_profile_mode_changed(self) -> None:
+        manual = self.profile_mode_combo.currentData() == "manual"
+        self.chk_select_all.setVisible(manual)
+        self.chk_clear_all.setVisible(manual)
+        self._profiles_label.setVisible(manual)
+        for cb in self.module_checks.values():
+            cb.setVisible(manual)
+        for cb in self.profile_checks.values():
+            cb.setVisible(manual)
+
+    def _on_select_all_toggled(self, checked: bool) -> None:
+        if not checked or self._syncing_filter_checks:
+            return
+        self._syncing_filter_checks = True
+        try:
+            for cb in self.module_checks.values():
+                cb.setChecked(True)
+            for cb in self.profile_checks.values():
+                cb.setChecked(True)
+            self.chk_select_all.setChecked(False)
+        finally:
+            self._syncing_filter_checks = False
+
+    def _on_clear_all_toggled(self, checked: bool) -> None:
+        if not checked or self._syncing_filter_checks:
+            return
+        self._syncing_filter_checks = True
+        try:
+            for cb in self.module_checks.values():
+                cb.setChecked(False)
+            for cb in self.profile_checks.values():
+                cb.setChecked(False)
+            self.chk_clear_all.setChecked(False)
+        finally:
+            self._syncing_filter_checks = False
+
+    def _on_length_mode_changed(self, value: int) -> None:
+        if int(value) >= 1:
+            self.length_mode_badge.setText("Режим: стандартные длины (кратно 50 мм)")
+            self.length_mode_badge.setStyleSheet(
+                "background:#dcfce7; color:#14532d; border:1px solid #86efac; "
+                "border-radius:6px; font-weight:600; padding:2px 8px;"
+            )
+        else:
+            self.length_mode_badge.setText("Режим: точный подбор (шаг 1 мм)")
+            self.length_mode_badge.setStyleSheet(
+                "background:#dbeafe; color:#1e3a8a; border:1px solid #93c5fd; "
+                "border-radius:6px; font-weight:600; padding:2px 8px;"
+            )
+
+    def _module_names_from_rows(self, rows_all: list[SpecRow]) -> list[str]:
+        found: set[str] = set()
+        for row in rows_all:
+            name = (row.module_name or "").strip()
+            if name:
+                found.add(name)
+        return sorted(found, key=self._module_order_key)
+
+    def _profiles_by_module_from_rows(self, rows_all: list[SpecRow]) -> dict[str, set[str]]:
+        mapping: dict[str, set[str]] = defaultdict(set)
+        for row in rows_all:
+            module = (row.module_name or "").strip()
+            profile = self._profile_filter_key(row.profile_code)
+            if module and profile:
+                mapping[module].add(profile)
+        return mapping
+
+    def _profile_filter_key(self, profile_code: str) -> str:
+        code = (profile_code or "").strip()
+        if not code:
+            return ""
+        series = profile_label_for_code(code)
+        if series != "—":
+            return series
+        return code
+
+    def _refresh_filters_from_path(self) -> None:
+        path = self.path_edit.text().strip()
+        if not path or not Path(path).is_file():
+            return
+        try:
+            rows_all = parse_specification(path)
+        except Exception:
+            return
+        modules = self._module_names_from_rows(rows_all)
+        if modules:
+            self._set_module_checkboxes(modules)
+        codes = self._profile_codes_from_rows(rows_all)
+        if codes:
+            self._set_profile_checkboxes(codes)
+
+    def _set_module_checkboxes(self, module_names: list[str]) -> None:
+        for cb in self._module_check_widgets:
+            cb.deleteLater()
+        self._module_check_widgets = []
+        prev = {
+            (name.strip().upper()): cb.isChecked()
+            for name, cb in self.module_checks.items()
+        }
+        self.module_checks.clear()
+        for idx, name in enumerate(module_names):
+            cb = QCheckBox(name)
+            cb.setChecked(prev.get(name.strip().upper(), False))
+            cb.toggled.connect(self._on_module_checkbox_toggled)
+            self.module_checks[name] = cb
+            self._module_checks_grid.addWidget(cb, 3 + (idx // 4), idx % 4)
+            self._module_check_widgets.append(cb)
+        self._module_rows_count = (len(module_names) + 3) // 4
+        self._profile_checks_grid.addWidget(self._profiles_label, 3 + self._module_rows_count, 0, 1, 1)
+        self._on_profile_mode_changed()
+
+    def _profile_codes_from_rows(self, rows_all: list[SpecRow]) -> list[str]:
+        found: set[str] = set()
+        for row in rows_all:
+            code = self._profile_filter_key(row.profile_code)
+            if code:
+                found.add(code)
+        return sorted(found)
+
+    def _set_profile_checkboxes(self, profile_codes: list[str]) -> None:
+        for cb in self._profile_check_widgets:
+            cb.deleteLater()
+        self._profile_check_widgets = []
+        prev = {
+            (name.strip().upper()): cb.isChecked()
+            for name, cb in self.profile_checks.items()
+        }
+        self.profile_checks.clear()
+        start_row = 4 + self._module_rows_count
+        for idx, code in enumerate(profile_codes):
+            cb = QCheckBox(code)
+            cb.setChecked(prev.get(code.strip().upper(), False))
+            cb.toggled.connect(self._on_profile_checkbox_toggled)
+            self.profile_checks[code] = cb
+            self._profile_checks_grid.addWidget(cb, start_row + (idx // 4), idx % 4)
+            self._profile_check_widgets.append(cb)
+        self._on_profile_mode_changed()
+
+    def _allowed_profiles(self, rows_all: list[SpecRow]) -> set[str]:
+        modules = self._module_names_from_rows(rows_all)
+        if modules:
+            self._set_module_checkboxes(modules)
+        codes = self._profile_codes_from_rows(rows_all)
+        if codes:
+            self._set_profile_checkboxes(codes)
+        mode = self.profile_mode_combo.currentData()
+        if mode == "all_from_spec":
+            for cb in self.module_checks.values():
+                cb.setChecked(True)
+            for cb in self.profile_checks.values():
+                cb.setChecked(True)
+            return set(self.profile_checks.keys())
+        return {name for name, cb in self.profile_checks.items() if cb.isChecked()}
+
+    def _filter_rows_by_selected_profiles(
+        self,
+        rows_all: list[SpecRow],
+        allowed_profiles: set[str],
+    ) -> tuple[list[SpecRow], list[str]]:
+        kept: list[SpecRow] = []
+        warns: list[str] = []
+        for row in rows_all:
+            key = self._profile_filter_key(row.profile_code)
+            if key in allowed_profiles:
+                kept.append(row)
+            else:
+                warns.append(
+                    f"Строка {row.row_index}: «{row.profile_code}» ({key}) не включён в раскрой"
+                )
+        return kept, warns
+
+    def _allowed_modules(self) -> set[str]:
+        mode = self.profile_mode_combo.currentData()
+        if mode == "all_from_spec":
+            return set(self.module_checks.keys())
+        return {name for name, cb in self.module_checks.items() if cb.isChecked()}
+
+    def _on_module_checkbox_toggled(self, _checked: bool) -> None:
+        if self._syncing_filter_checks:
+            return
+        if self.profile_mode_combo.currentData() != "manual":
+            return
+        selected_modules = {name for name, cb in self.module_checks.items() if cb.isChecked()}
+        if not selected_modules:
+            return
+        path = self.path_edit.text().strip()
+        if not path or not Path(path).is_file():
+            return
+        try:
+            rows_all = parse_specification(path)
+        except Exception:
+            return
+        mapping = self._profiles_by_module_from_rows(rows_all)
+        auto_profiles: set[str] = set()
+        for name in selected_modules:
+            auto_profiles.update(mapping.get(name, set()))
+        self._syncing_filter_checks = True
+        try:
+            for code, cb in self.profile_checks.items():
+                if code in auto_profiles:
+                    cb.setChecked(True)
+        finally:
+            self._syncing_filter_checks = False
+
+    def _on_profile_checkbox_toggled(self, _checked: bool) -> None:
+        if self._syncing_filter_checks:
+            return
+        if self.profile_mode_combo.currentData() != "manual":
+            return
+        selected_profiles = {name for name, cb in self.profile_checks.items() if cb.isChecked()}
+        if not selected_profiles:
+            return
+        path = self.path_edit.text().strip()
+        if not path or not Path(path).is_file():
+            return
+        try:
+            rows_all = parse_specification(path)
+        except Exception:
+            return
+        mapping = self._profiles_by_module_from_rows(rows_all)
+        modules_to_check: set[str] = set()
+        for module_name, profiles in mapping.items():
+            if profiles.intersection(selected_profiles):
+                modules_to_check.add(module_name)
+        self._syncing_filter_checks = True
+        try:
+            for module_name, cb in self.module_checks.items():
+                if module_name in modules_to_check:
+                    cb.setChecked(True)
+        finally:
+            self._syncing_filter_checks = False
+
+    def _current_offsets(self) -> tuple[int, int, str]:
+        try:
+            offset_90 = int(self.tech_90_edit.text().strip() or "0")
+            offset_other = int(self.tech_other_edit.text().strip() or "0")
+        except ValueError:
+            return 0, 0, "Технологические отступы должны быть целыми числами"
+        if offset_90 < 0 or offset_other < 0:
+            return 0, 0, "Технологические отступы не могут быть отрицательными"
+        return offset_90, offset_other, ""
+
+    def _refresh_project_caption(self) -> None:
+        name = self._project_name.strip() or "—"
+        cipher = self._project_cipher.strip() or "—"
+        if hasattr(self, "layout_project_label"):
+            self.layout_project_label.setText(f"Проект: {name}   |   Шифр: {cipher}")
+        if hasattr(self, "layout_widget"):
+            self.layout_widget.set_project_meta(self._project_name, self._project_cipher)
+
+    def _load_project_metadata(self, path: str) -> None:
+        self._project_name = ""
+        self._project_cipher = ""
+        if not path:
+            self._refresh_project_caption()
+            return
+        try:
+            name, cipher = parse_project_metadata(path)
+            self._project_name = name
+            self._project_cipher = cipher
+        except Exception:
+            logger.exception("Project metadata read failed: %s", path)
+        self._refresh_project_caption()
+
     def _enable_text_copy(self, widget: QWidget) -> None:
         """Контекстное меню для текстовых панелей (копирование — через ApplicationShortcut)."""
         if hasattr(widget, "setContextMenuPolicy"):
@@ -1237,15 +1845,17 @@ class MainWindow(QMainWindow):
         return None
 
     def _append_live_log(self, text: str) -> None:
-        self.log_view.appendPlainText(text)
-        self.log_view.verticalScrollBar().setValue(
-            self.log_view.verticalScrollBar().maximum()
-        )
+        self._live_log_lines.append(text)
+        if self._log_dialog_view is not None:
+            self._log_dialog_view.appendPlainText(text)
+            self._log_dialog_view.verticalScrollBar().setValue(
+                self._log_dialog_view.verticalScrollBar().maximum()
+            )
 
     def _save_live_log(self) -> None:
-        text = self.log_view.toPlainText().strip()
+        text = "\n".join(self._live_log_lines).strip()
         if not text:
-            QMessageBox.information(self, "Логи", "Панель логов пуста.")
+            QMessageBox.information(self, "Логи", "Логи пока пусты.")
             return
         base = self.path_edit.text().strip()
         default_dir = str(Path(base).parent) if base else ""
@@ -1266,8 +1876,58 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Логи", f"Сохранено:\n{p}")
 
     def _clear_live_log(self) -> None:
-        self.log_view.clear()
+        self._live_log_lines = []
+        if self._log_dialog_view is not None:
+            self._log_dialog_view.clear()
         logger.info("Live log view cleared by user")
+
+    def _show_logs_dialog(self) -> None:
+        if self._log_dialog is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Логи в реальном времени")
+            dlg.resize(900, 520)
+            l = QVBoxLayout(dlg)
+            view = QPlainTextEdit()
+            view.setReadOnly(True)
+            view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            view.setFont(QFont("Consolas", 9))
+            view.setPlaceholderText("Логи расчётов и ошибок появятся здесь…")
+            self._enable_text_copy(view)
+            l.addWidget(view, 1)
+            btns = QHBoxLayout()
+            btn_save = QPushButton("Сохранить лог")
+            btn_save.clicked.connect(self._save_live_log)
+            btns.addWidget(btn_save)
+            btn_clear = QPushButton("Очистить лог")
+            btn_clear.clicked.connect(self._clear_live_log)
+            btns.addWidget(btn_clear)
+            btns.addStretch(1)
+            l.addLayout(btns)
+            self._log_dialog = dlg
+            self._log_dialog_view = view
+        if self._log_dialog_view is not None:
+            self._log_dialog_view.setPlainText("\n".join(self._live_log_lines))
+            self._log_dialog_view.verticalScrollBar().setValue(
+                self._log_dialog_view.verticalScrollBar().maximum()
+            )
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def _show_profiles_dialog(self) -> None:
+        dlg = ProfileLibraryDialog(self, get_editable_profile_entries())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            save_editable_profile_entries(dlg.result_rows)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Таблица профилей", f"Не удалось сохранить:\n{e}")
+            return
+        QMessageBox.information(
+            self,
+            "Таблица профилей",
+            "Изменения сохранены и будут использоваться в расчетах.",
+        )
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() == QEvent.Type.Wheel:
@@ -1290,6 +1950,10 @@ class MainWindow(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.main_splitter.setSizes([self._left_panel_fixed_width, max(420, self.width() - self._left_panel_fixed_width)])
+
     def _set_table_zoom(self, zoom: float) -> None:
         self._table_zoom = max(1.0, min(2.0, float(zoom)))
         body_sz = max(9, int(round(10 * self._table_zoom)))
@@ -1308,6 +1972,8 @@ class MainWindow(QMainWindow):
         *,
         result: OptimizationResult,
         kerf_mm: int,
+        offset_90_mm: int,
+        offset_other_mm: int,
         chart_metrics: dict[str, object] | None,
     ) -> None:
         """
@@ -1316,13 +1982,20 @@ class MainWindow(QMainWindow):
         """
         self._optimizer_cuts = list(result.cuts)
         self._last_kerf_mm = kerf_mm
+        self._last_offset_90_mm = offset_90_mm
+        self._last_offset_other_mm = offset_other_mm
         self.btn_xlsx.setEnabled(True)
         self.btn_pdf.setEnabled(True)
         self.btn_recalc.setEnabled(True)
         self.btn_layout_xlsx.setEnabled(True)
         self.btn_layout_pdf.setEnabled(True)
         self.btn_album_pdf.setEnabled(True)
-        self._update_layout_plan(result.cuts, kerf_mm=kerf_mm)
+        self._update_layout_plan(
+            result.cuts,
+            kerf_mm=kerf_mm,
+            offset_90_mm=offset_90_mm,
+            offset_other_mm=offset_other_mm,
+        )
         self._update_album_plan(result.cuts)
         self._apply_chart_metrics(chart_metrics)
         self._apply_sort()
@@ -1380,6 +2053,8 @@ class MainWindow(QMainWindow):
         self,
         demands: list[PartDemand],
         kerf_mm: int,
+        offset_90_mm: int,
+        offset_other_mm: int,
     ) -> tuple[list[int], str]:
         try:
             base_len = int(self.base_bar_edit.text().strip() or "0")
@@ -1390,7 +2065,15 @@ class MainWindow(QMainWindow):
         if base_len > 12000:
             return [], "Базовая длина не должна превышать 12000 мм"
 
-        required = [demand_cut_length_mm(d, kerf_mm) for d in demands]
+        required = [
+            demand_cut_length_mm(
+                d,
+                kerf_mm,
+                offset_90_mm=offset_90_mm,
+                offset_other_mm=offset_other_mm,
+            )
+            for d in demands
+        ]
         if required and max(required) > 12000:
             return [], (
                 "Есть детали, требующие заготовку больше 12000 мм "
@@ -1409,12 +2092,18 @@ class MainWindow(QMainWindow):
         path = self.path_edit.text().strip()
         if not path or not Path(path).is_file():
             return None, "Укажите файл спецификации", []
-        allowed: set[int] = {d for d, cb in self.profile_checks.items() if cb.isChecked()}
-        if not allowed:
-            return None, "Отметьте хотя бы один профиль Н20–Н23", []
         try:
             rows_all = parse_specification(path)
-            rows, warns = filter_spec_by_profiles(rows_all, allowed)
+            allowed = self._allowed_profiles(rows_all)
+            allowed_modules = self._allowed_modules()
+            if not allowed_modules:
+                return None, "По текущему фильтру модулей нет выбранных модулей", []
+            rows_all = [r for r in rows_all if r.module_name in allowed_modules]
+            if not rows_all:
+                return None, "После фильтра по модулям нет строк", []
+            if not allowed:
+                return None, "По текущему фильтру профилей нет выбранных профилей", []
+            rows, warns = self._filter_rows_by_selected_profiles(rows_all, allowed)
         except Exception as e:  # noqa: BLE001
             return None, str(e), []
         if not rows:
@@ -1425,12 +2114,16 @@ class MainWindow(QMainWindow):
         logger.info("Bar advisor requested")
         demands, err, fw = self._demands_from_spec()
         if demands is None:
-            QMessageBox.warning(self, "Подбор заготовок", err)
+            QMessageBox.warning(self, "Подбор оптимальной длины", err)
             return
         try:
             kerf = int(self.kerf_edit.text().strip() or "0")
         except ValueError:
-            QMessageBox.critical(self, "Ошибка", "Пропил должен быть целым числом")
+            QMessageBox.critical(self, "Ошибка", "Ширина пропила должна быть целым числом")
+            return
+        offset_90, offset_other, off_err = self._current_offsets()
+        if off_err:
+            QMessageBox.critical(self, "Ошибка", off_err)
             return
         try:
             base_len = int(self.base_bar_edit.text().strip() or "0")
@@ -1445,7 +2138,18 @@ class MainWindow(QMainWindow):
             return
         min_scrap = 0
         initial, scrap_warns = self._load_initial_scraps()
-        required_max = max((demand_cut_length_mm(d, kerf) for d in demands), default=0)
+        required_max = max(
+            (
+                demand_cut_length_mm(
+                    d,
+                    kerf,
+                    offset_90_mm=offset_90,
+                    offset_other_mm=offset_other,
+                )
+                for d in demands
+            ),
+            default=0,
+        )
         if required_max > 12000:
             QMessageBox.critical(
                 self,
@@ -1454,20 +2158,69 @@ class MainWindow(QMainWindow):
                 f"(максимум требуется: {required_max} мм)",
             )
             return
-        scan_from = max(required_max, base_len - 500)
-        scan_to = min(12000, max(base_len + 1000, required_max + 1000))
-        candidates = set(range(scan_from, scan_to + 1, 50))
-        candidates.add(base_len)
-        candidates.add(required_max)
-        candidates = {x for x in candidates if required_max <= x <= 12000}
-        scenarios = [(f"Только {b} мм", (b,)) for b in sorted(candidates)]
-        outcomes = compare_bar_scenarios(
-            demands,
-            kerf_mm=kerf,
-            min_scrap_mm=min_scrap,
-            initial_scraps_mm=initial if initial else None,
-            scenarios=scenarios,
-        )
+        standard_mode = int(self.length_mode_slider.value()) >= 1
+        if standard_mode:
+            # Подбираем только технологичные длины (кратно 50 мм),
+            # чтобы не рекомендовать "случайные" нестандартные значения вроде 6881.
+            step_mm = 50
+            scan_from = ((required_max + 49) // 50) * 50
+            scan_to = 12000
+            candidates = set(range(scan_from, scan_to + 1, step_mm))
+            if base_len % step_mm == 0:
+                candidates.add(base_len)
+            candidates = {x for x in candidates if scan_from <= x <= 12000}
+            scenarios = [(f"Только {b} мм", (b,)) for b in sorted(candidates)]
+            outcomes = compare_bar_scenarios(
+                demands,
+                kerf_mm=kerf,
+                offset_90_mm=offset_90,
+                offset_other_mm=offset_other,
+                min_scrap_mm=min_scrap,
+                initial_scraps_mm=initial if initial else None,
+                scenarios=scenarios,
+            )
+        else:
+            # Быстрый двухэтапный режим:
+            # 1) грубый поиск по 50 мм на всём диапазоне;
+            # 2) уточнение по 1 мм в окрестности лучших кандидатов.
+            coarse_from = ((required_max + 49) // 50) * 50
+            coarse_to = 12000
+            coarse_candidates = set(range(coarse_from, coarse_to + 1, 50))
+            if base_len % 50 == 0 and base_len >= coarse_from:
+                coarse_candidates.add(base_len)
+            coarse_scenarios = [(f"Только {b} мм", (b,)) for b in sorted(coarse_candidates)]
+            coarse_outcomes = compare_bar_scenarios(
+                demands,
+                kerf_mm=kerf,
+                offset_90_mm=offset_90,
+                offset_other_mm=offset_other,
+                min_scrap_mm=min_scrap,
+                initial_scraps_mm=initial if initial else None,
+                scenarios=coarse_scenarios,
+            )
+            coarse_ok = [o for o in coarse_outcomes if o.ok and o.result is not None]
+            if coarse_ok:
+                top = sorted(coarse_ok, key=lambda o: (o.waste_pct, o.total_bars, o.material_mm))[:5]
+                refine_candidates: set[int] = set()
+                for o in top:
+                    center = o.bars_mm[0]
+                    lo = max(required_max, center - 60)
+                    hi = min(12000, center + 60)
+                    refine_candidates.update(range(lo, hi + 1))
+                refine_candidates.add(required_max)
+                refine_candidates.add(min(12000, base_len))
+                refine_scenarios = [(f"Только {b} мм", (b,)) for b in sorted(refine_candidates)]
+                outcomes = compare_bar_scenarios(
+                    demands,
+                    kerf_mm=kerf,
+                    offset_90_mm=offset_90,
+                    offset_other_mm=offset_other,
+                    min_scrap_mm=min_scrap,
+                    initial_scraps_mm=initial if initial else None,
+                    scenarios=refine_scenarios,
+                )
+            else:
+                outcomes = coarse_outcomes
         mode = "waste_first"
         text = format_scenario_report(outcomes, mode=mode)
         extra = list(fw) + list(scrap_warns)
@@ -1498,7 +2251,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Автовыбор длин",
-                "Сначала нажмите «Подбор заготовок», чтобы получить рекомендацию.",
+                "Сначала нажмите «Подобрать оптимальную длину заготовки», чтобы получить рекомендацию.",
             )
             return
         recommended_len = self._recommended_bars[0]
@@ -1550,6 +2303,9 @@ class MainWindow(QMainWindow):
                 self._last_sorted_cuts,
                 p,
                 summary=self._last_summary_text,
+                project_name=self._project_name,
+                project_cipher=self._project_cipher,
+                logo_path=_LOGO_PATH if _LOGO_PATH.is_file() else None,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Export PDF failed")
@@ -1649,13 +2405,45 @@ class MainWindow(QMainWindow):
         font_regular, font_bold = _reportlab_cyrillic_fonts()
         c = canvas.Canvas(str(Path(p)), pagesize=landscape(base_page))
         pw, ph = landscape(base_page)
-        y = ph - 18 * mm
-        c.setFont(font_bold, 11)
-        c.drawString(12 * mm, y, "Схема раскроя")
-        y -= 10 * mm
-        x0 = 40 * mm
-        w = pw - 52 * mm
+        all_profile_names: set[str] = set()
+        for row in self._layout_rows:
+            segs = row.get("segments", [])
+            if not isinstance(segs, list):
+                continue
+            for seg in segs:
+                if not isinstance(seg, dict):
+                    continue
+                if str(seg.get("kind", "")) != "profile":
+                    continue
+                name = str(seg.get("profile_name", "")).strip()
+                if name:
+                    all_profile_names.add(name)
+        layout_color_map = self._profile_color_map(sorted(all_profile_names))
+
+        def _draw_pdf_header() -> float:
+            y0 = ph - 12 * mm
+            if _LOGO_PATH.is_file():
+                c.drawImage(str(_LOGO_PATH), 12 * mm, y0 - 7.5 * mm, width=30 * mm, height=5 * mm, mask="auto")
+                c.setFillColor(colors.HexColor("#105799"))
+                c.setFont(font_bold, 9)
+                c.drawString(12 * mm, y0 - 10.8 * mm, "РАСКРОЙ")
+            header_x = 50 * mm
+            c.setFillColor(colors.black)
+            c.setFont(font_bold, 11)
+            c.drawString(header_x, y0, "Схема раскроя")
+            c.setFont(font_regular, 8)
+            c.drawString(header_x, y0 - 4 * mm, f"Проект: {self._project_name or '—'}")
+            c.drawString(header_x, y0 - 8 * mm, f"Шифр: {self._project_cipher or '—'}")
+            return y0 - 40 * mm
+
+        y = _draw_pdf_header()
+        card_x = 12 * mm
+        card_w = pw - 24 * mm
+        title_w = 58 * mm
+        x0 = card_x + title_w + 2 * mm
+        w = card_w - title_w - 4 * mm
         bar_h = 6 * mm
+        card_h = 11 * mm
         overflow_entries: list[dict[str, object]] = []
         overflow_idx = 0
         for row in self._layout_rows:
@@ -1665,27 +2453,42 @@ class MainWindow(QMainWindow):
             segs = row.get("segments", [])
             if y < 20 * mm:
                 c.showPage()
-                y = ph - 18 * mm
-                c.setFont(font_bold, 11)
-                c.drawString(12 * mm, y, "Схема раскроя")
-                y -= 10 * mm
-            c.setFillColor(colors.black)
-            c.setFont(font_regular, 7)
-            c.drawString(12 * mm, y + 2 * mm, f"Пруток {opening} ({bar_len} мм)")
-            oc = opening_row_color(opening)
-            c.setFillColor(colors.Color(oc.red() / 255.0, oc.green() / 255.0, oc.blue() / 255.0))
-            c.rect(9 * mm, y + 0.5 * mm, 1.8 * mm, bar_h - 1.0 * mm, stroke=0, fill=1)
-            scrap_marks = {
-                str(seg.get("origin", ""))
-                for seg in segs
-                if isinstance(seg, dict) and str(seg.get("kind", "")) == "profile" and bool(seg.get("is_scrap"))
-            }
-            if scrap_marks:
-                c.setFillColor(colors.HexColor("#475569"))
-                c.setFont(font_regular, 5)
-                c.drawString(12 * mm, y - 1.2 * mm, "Обрезки: " + ", ".join(sorted(scrap_marks)))
+                y = _draw_pdf_header()
+            row_profiles = sorted(
+                {
+                    str(seg.get("profile_name", ""))
+                    for seg in segs
+                    if isinstance(seg, dict) and str(seg.get("kind", "")) == "profile"
+                }
+            )
+            profile_txt = ", ".join([x for x in row_profiles if x][:2])
+            if len(row_profiles) > 2:
+                profile_txt += ", ..."
+            bar_title = f"Пруток {opening} ({bar_len} мм)"
+            if profile_txt:
+                bar_title += f" - {profile_txt}"
+            title_lines = [bar_title]
+            if len(bar_title) > 44 and " - " in bar_title:
+                a, b = bar_title.split(" - ", 1)
+                title_lines = [a + " -", b]
+            card_y = y
+            # Карточка прутка: слева блок подписи, справа блок рисунка.
             c.setStrokeColor(colors.HexColor("#94a3b8"))
-            c.rect(x0, y, w, bar_h, stroke=1, fill=0)
+            c.setLineWidth(0.5)
+            c.rect(card_x, card_y, card_w, card_h, stroke=1, fill=0)
+            c.setFillColor(colors.HexColor("#f8fafc"))
+            c.rect(card_x, card_y, title_w, card_h, stroke=0, fill=1)
+            c.setStrokeColor(colors.HexColor("#cbd5e1"))
+            c.line(card_x + title_w, card_y, card_x + title_w, card_y + card_h)
+            c.setFillColor(colors.black)
+            c.setFont(font_bold, 8)
+            if len(title_lines) == 2:
+                c.drawString(card_x + 2 * mm, card_y + 6.9 * mm, title_lines[0])
+                c.drawString(card_x + 2 * mm, card_y + 3.1 * mm, title_lines[1])
+            else:
+                c.drawString(card_x + 2 * mm, card_y + 5.0 * mm, title_lines[0])
+            c.setStrokeColor(colors.HexColor("#94a3b8"))
+            c.rect(x0, card_y + 2.5 * mm, w, bar_h, stroke=1, fill=0)
             pos = 0.0
             profile_idx = 0
             if isinstance(segs, list):
@@ -1700,25 +2503,32 @@ class MainWindow(QMainWindow):
                     kind = str(seg.get("kind", ""))
                     if kind == "profile":
                         profile_name = str(seg.get("profile_name", ""))
-                        qc = self._profile_color_map([profile_name]).get(profile_name, QColor(96, 165, 250))
+                        qc = layout_color_map.get(profile_name, QColor(96, 165, 250))
                         c.setFillColor(colors.Color(qc.red() / 255.0, qc.green() / 255.0, qc.blue() / 255.0))
-                        c.rect(sx, y, sw, bar_h, stroke=0, fill=1)
+                        c.rect(sx, card_y + 2.5 * mm, sw, bar_h, stroke=0, fill=1)
                     elif kind == "tech":
                         c.setFillColor(colors.HexColor("#ffedd5"))
                         c.setStrokeColor(colors.HexColor("#ea580c"))
                         c.setLineWidth(0.35)
-                        c.rect(sx, y, sw, bar_h, stroke=1, fill=1)
-                        if sw >= 1.5 * mm:
-                            c.setFillColor(colors.HexColor("#c2410c"))
-                            c.setFont(font_bold, 4)
-                            c.drawCentredString(
-                                sx + sw / 2.0,
-                                y + bar_h + 2.2 * mm,
-                                str(int(seg.get("tech_mm", 30))),
-                            )
+                        c.rect(sx, card_y + 2.5 * mm, sw, bar_h, stroke=1, fill=1)
+                        badge_w = max(3.6 * mm, sw + 1.2 * mm)
+                        badge_h = 2.3 * mm
+                        bx = sx + (sw - badge_w) / 2.0
+                        by = card_y + bar_h + 4.1 * mm
+                        c.setFillColor(colors.HexColor("#fff7ed"))
+                        c.setStrokeColor(colors.HexColor("#ea580c"))
+                        c.setLineWidth(0.3)
+                        c.roundRect(bx, by, badge_w, badge_h, 0.6 * mm, stroke=1, fill=1)
+                        c.setFillColor(colors.HexColor("#9a3412"))
+                        c.setFont(font_bold, 3.6)
+                        c.drawCentredString(
+                            bx + badge_w / 2.0,
+                            by + 0.55 * mm,
+                            str(int(seg.get("tech_mm", 30))),
+                        )
                     else:
                         c.setFillColor(colors.white)
-                        c.rect(sx, y, sw, bar_h, stroke=0, fill=1)
+                        c.rect(sx, card_y + 2.5 * mm, sw, bar_h, stroke=0, fill=1)
                     if kind == "profile":
                         left_a = int(seg.get("left_angle", 90))
                         right_a = int(seg.get("right_angle", left_a))
@@ -1728,19 +2538,19 @@ class MainWindow(QMainWindow):
                             txt = str(seg.get("label", ""))
                             c.setFillColor(colors.black)
                             c.setFont(font_regular, 5)
-                            c.drawCentredString(sx + sw / 2.0, y + (bar_h / 2.0) - 2, txt)
+                            c.drawCentredString(sx + sw / 2.0, card_y + 2.5 * mm + (bar_h / 2.0) - 2, txt)
                         if draw_angles:
                             c.setFillColor(colors.HexColor("#334155"))
                             c.setFont(font_regular, 4)
-                            c.drawString(sx + 0.7 * mm, y + 0.5 * mm, f"L{left_a}°")
-                            c.drawRightString(sx + sw - 0.7 * mm, y + 0.5 * mm, f"R{right_a}°")
+                            c.drawString(sx + 0.7 * mm, card_y + 3.0 * mm, f"L{left_a}°")
+                            c.drawRightString(sx + sw - 0.7 * mm, card_y + 3.0 * mm, f"R{right_a}°")
                         # Если углы не влезли, добавляем деталь в легенду.
                         if not draw_angles:
                             overflow_idx += 1
                             mark = f"#{overflow_idx}"
                             c.setFillColor(colors.black)
                             c.setFont(font_bold, 5)
-                            c.drawRightString(sx + sw - 0.4 * mm, y + (bar_h / 2.0) - 2, mark)
+                            c.drawRightString(sx + sw - 0.4 * mm, card_y + 2.5 * mm + (bar_h / 2.0) - 2, mark)
                             overflow_entries.append(
                                 {
                                     "id": overflow_idx,
@@ -1760,16 +2570,16 @@ class MainWindow(QMainWindow):
                         c.setFillColor(colors.HexColor("#cffafe"))
                         c.setStrokeColor(colors.HexColor("#0e7490"))
                         c.setLineWidth(0.35)
-                        c.rect(sx, y, sw, bar_h, stroke=1, fill=1)
+                        c.rect(sx, card_y + 2.5 * mm, sw, bar_h, stroke=1, fill=1)
                         c.setLineWidth(0.45)
-                        c.line(sx, y, sx, y + bar_h)
-                        c.line(sx + sw, y, sx + sw, y + bar_h)
+                        c.line(sx, card_y + 2.5 * mm, sx, card_y + 2.5 * mm + bar_h)
+                        c.line(sx + sw, card_y + 2.5 * mm, sx + sw, card_y + 2.5 * mm + bar_h)
                         if sw >= 2.0 * mm:
                             c.setFillColor(colors.HexColor("#155e75"))
                             c.setFont(font_regular, 4)
                             c.drawCentredString(
                                 sx + sw / 2.0,
-                                y + (bar_h / 2.0) - 1,
+                                card_y + 2.5 * mm + (bar_h / 2.0) - 1,
                                 str(int(seg.get("kerf_mm", 4))),
                             )
                     pos += seg_len
@@ -1778,17 +2588,17 @@ class MainWindow(QMainWindow):
                 rw = w * (rem / bar_len)
                 c.setStrokeColor(colors.HexColor("#64748b"))
                 c.setDash(2, 2)
-                c.rect(rx, y, rw, bar_h, stroke=1, fill=0)
+                c.rect(rx, card_y + 2.5 * mm, rw, bar_h, stroke=1, fill=0)
                 c.setDash()
                 if rw >= 12 * mm:
                     c.setFillColor(colors.HexColor("#475569"))
                     c.setFont(font_regular, 5)
-                    c.drawCentredString(rx + rw / 2.0, y + (bar_h / 2.0) - 2, f"остаток {rem}")
-            y -= 11.5 * mm
+                    c.drawCentredString(rx + rw / 2.0, card_y + 2.5 * mm + (bar_h / 2.0) - 2, f"остаток {rem}")
+            y -= 13.5 * mm
         if overflow_entries:
             if y < 35 * mm:
                 c.showPage()
-                y = ph - 18 * mm
+                y = _draw_pdf_header()
             c.setFillColor(colors.black)
             c.setFont(font_bold, 8)
             c.drawString(12 * mm, y, "Легенда коротких сегментов (#)")
@@ -1807,7 +2617,7 @@ class MainWindow(QMainWindow):
             for e in overflow_entries:
                 if y < 14 * mm:
                     c.showPage()
-                    y = ph - 18 * mm
+                    y = _draw_pdf_header()
                     c.setFont(font_bold, 8)
                     c.drawString(12 * mm, y, "Легенда коротких сегментов (#)")
                     y -= 6 * mm
@@ -1859,20 +2669,34 @@ class MainWindow(QMainWindow):
         font_regular, font_bold = _reportlab_cyrillic_fonts()
         c = canvas.Canvas(str(Path(p)), pagesize=A4)
         pw, ph = A4
-        y = ph - 16 * mm
-        c.setFont(font_bold, 11)
-        c.drawString(12 * mm, y, "Альбом стыков (A4, вертикально)")
-        y -= 8 * mm
-        left_x = 38 * mm
-        detail_w = (pw - 2 * left_x) / 2
-        detail_h = 18 * mm
+        def _draw_pdf_header() -> float:
+            y0 = ph - 12 * mm
+            if _LOGO_PATH.is_file():
+                c.drawImage(str(_LOGO_PATH), 12 * mm, y0 - 7.5 * mm, width=30 * mm, height=5 * mm, mask="auto")
+                c.setFillColor(colors.HexColor("#105799"))
+                c.setFont(font_bold, 9)
+                c.drawString(12 * mm, y0 - 10.8 * mm, "РАСКРОЙ")
+            c.setFillColor(colors.black)
+            header_x = 50 * mm
+            c.setFont(font_bold, 11)
+            c.drawString(header_x, y0, "Альбом стыков (A4, вертикально)")
+            c.setFont(font_regular, 8)
+            c.drawString(header_x, y0 - 4 * mm, f"Проект: {self._project_name or '—'}")
+            c.drawString(header_x, y0 - 8 * mm, f"Шифр: {self._project_cipher or '—'}")
+            # Такой же увеличенный отступ после шапки, как в PDF схемы раскроя.
+            return y0 - 40 * mm
+
+        y = _draw_pdf_header()
+        # Сверхкомпактная верстка: высота блоков уменьшена примерно в 2 раза.
+        detail_h = 7 * mm
+        row_h = 10.5 * mm
+        caption_w = 48 * mm
+        joint_no = 0
+        detail_no = 0
         for r in self._album_rows:
-            if y < 34 * mm:
+            if y < 20 * mm:
                 c.showPage()
-                y = ph - 16 * mm
-                c.setFont(font_bold, 11)
-                c.drawString(12 * mm, y, "Альбом стыков (A4, вертикально)")
-                y -= 8 * mm
+                y = _draw_pdf_header()
             opening = int(r.get("opening", 0))
             kind = str(r.get("kind", "joint"))
             left_title = str(r.get("left_title", ""))
@@ -1886,18 +2710,65 @@ class MainWindow(QMainWindow):
             kerf_mm = int(r.get("kerf_mm", 4))
             c.setFont(font_bold, 8)
             c.setFillColor(colors.black)
-            c.drawString(
-                12 * mm,
-                y + 2 * mm,
-                f"Пруток {opening}: {'стык' if kind == 'joint' else 'деталь'}",
-            )
-            ly = y - detail_h
-            seam_x = left_x + detail_w
+            if kind == "detail":
+                detail_no += 1
+                row_caption = f"Пруток {opening}: деталь №{detail_no}"
+            else:
+                joint_no += 1
+                row_caption = f"Пруток {opening}: стык №{joint_no}"
+            row_top = y
+            row_left = 11.5 * mm
+            row_w = pw - 23.0 * mm
+            # Левый блок подписи (в одной строке с рисунком).
+            c.setStrokeColor(colors.HexColor("#cbd5e1"))
+            c.setFillColor(colors.HexColor("#f8fafc"))
+            c.setLineWidth(0.6)
+            c.roundRect(row_left, row_top - row_h, caption_w, row_h, 2.0 * mm, stroke=1, fill=1)
+            c.setFillColor(colors.black)
+            c.setFont(font_bold, 5.5)
+            c.drawString(row_left + 1.2 * mm, row_top - (row_h / 2.0) + 0.35 * mm, row_caption)
+            # Правый блок рисунка.
+            drawing_x = row_left + caption_w + 1.8 * mm
+            drawing_w = row_w - caption_w - 1.8 * mm
+            c.setStrokeColor(colors.HexColor("#cbd5e1"))
+            c.setFillColor(colors.white)
+            c.roundRect(drawing_x, row_top - row_h, drawing_w, row_h, 2.0 * mm, stroke=1, fill=1)
+            local_detail_w = max(36 * mm, (drawing_w - 3 * mm) / 2.0)
+            ly = row_top - row_h + (row_h - detail_h) / 2.0
+            if kind == "detail":
+                left_card_x = drawing_x + (drawing_w - local_detail_w) / 2.0
+                seam_x = left_card_x + local_detail_w
+            else:
+                left_card_x = drawing_x + 1.0 * mm
+                seam_x = left_card_x + local_detail_w
             ltw = 4 * mm if left_tech == 50 else 2.5 * mm
             rtw = 4 * mm if right_tech == 50 else 2.5 * mm
             kw = 1.8 * mm if kerf_mm >= 4 else 1.2 * mm
             yb = ly + detail_h
             yt = ly
+
+            def _two_line_title(text: str, width_mm: float) -> tuple[str, str]:
+                raw = (text or "").strip()
+                if not raw:
+                    return "", ""
+                words = raw.split()
+                if not words:
+                    return raw[:30], ""
+                max_w = float(width_mm) - 4.0 * mm
+                l1 = ""
+                l2 = ""
+                for wtxt in words:
+                    cand = (l1 + " " + wtxt).strip()
+                    if c.stringWidth(cand, font_regular, 7) <= max_w or not l1:
+                        l1 = cand
+                        continue
+                    cand2 = (l2 + " " + wtxt).strip()
+                    if c.stringWidth(cand2, font_regular, 7) <= max_w or not l2:
+                        l2 = cand2
+                    else:
+                        l2 = (cand2[:24] + "…") if len(cand2) > 24 else cand2
+                        break
+                return l1, l2
 
             def _pdf_strip_card(
                 x0: float,
@@ -1906,17 +2777,26 @@ class MainWindow(QMainWindow):
                 title: str,
                 base_fill: colors.Color,
             ) -> None:
-                ze = x0 + detail_w - kw
+                ze = x0 + local_detail_w - kw
                 c.setStrokeColor(colors.HexColor("#e2e8f0"))
                 c.setFillColor(base_fill)
-                c.rect(x0, ly, detail_w, detail_h, stroke=1, fill=1)
+                c.rect(x0, ly, local_detail_w, detail_h, stroke=1, fill=1)
                 c.setFillColor(colors.HexColor("#ffedd5"))
                 c.setStrokeColor(colors.HexColor("#ea580c"))
                 c.setLineWidth(0.3)
                 c.rect(x0, ly, tech_w, detail_h, stroke=1, fill=1)
-                c.setFillColor(colors.HexColor("#c2410c"))
-                c.setFont(font_bold, 6)
-                c.drawCentredString(x0 + tech_w / 2.0, yt + detail_h + 1.8 * mm, str(tech_mm_val))
+                # Бейдж техотступа как в схеме раскроя (скругленный, только число).
+                badge_w = max(4.0 * mm, tech_w + 1.2 * mm)
+                badge_h = 2.4 * mm
+                bx = x0 + (tech_w - badge_w) / 2.0
+                by = yt + detail_h + 1.1 * mm
+                c.setFillColor(colors.HexColor("#fff7ed"))
+                c.setStrokeColor(colors.HexColor("#ea580c"))
+                c.setLineWidth(0.25)
+                c.roundRect(bx, by, badge_w, badge_h, 0.6 * mm, stroke=1, fill=1)
+                c.setFillColor(colors.HexColor("#9a3412"))
+                c.setFont(font_bold, 3.2)
+                c.drawCentredString(bx + badge_w / 2.0, by + 0.62 * mm, str(int(tech_mm_val)))
                 kx0 = x0 + tech_w
                 c.setFillColor(colors.HexColor("#cffafe"))
                 c.setStrokeColor(colors.HexColor("#0e7490"))
@@ -1925,8 +2805,8 @@ class MainWindow(QMainWindow):
                 c.line(kx0, yt, kx0, yb)
                 c.line(kx0 + kw, yt, kx0 + kw, yb)
                 c.setFillColor(colors.HexColor("#155e75"))
-                c.setFont(font_regular, 6)
-                c.drawCentredString(kx0 + kw / 2.0, ly + detail_h / 2.0 - 1.0, str(kerf_mm))
+                c.setFont(font_regular, 4.6)
+                c.drawCentredString(kx0 + kw / 2.0, ly + detail_h / 2.0 - 0.6, str(kerf_mm))
                 body_x = x0 + tech_w + kw
                 body_w = ze - body_x
                 c.setFillColor(base_fill)
@@ -1940,34 +2820,57 @@ class MainWindow(QMainWindow):
                 c.setFillColor(colors.HexColor("#155e75"))
                 c.drawCentredString(ze + kw / 2.0, ly + detail_h / 2.0 - 1.0, str(kerf_mm))
                 c.setFillColor(colors.black)
-                c.setFont(font_regular, 7)
-                c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 2, title[:42])
+                c.setFont(font_regular, 4.8)
+                t1, t2 = _two_line_title(title, body_w)
+                if t2:
+                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 + 0.55 * mm, t1)
+                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 0.7 * mm, t2)
+                else:
+                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 0.2 * mm, t1)
 
+            def _draw_pdf_angles_in_body(
+                x0: float,
+                tech_w: float,
+                left_deg: int,
+                right_deg: int,
+            ) -> None:
+                body_x = x0 + tech_w + kw
+                body_w = max(8 * mm, local_detail_w - tech_w - 2 * kw)
+                ay = ly + 0.9 * mm
+                c.setFillColor(colors.HexColor("#334155"))
+                c.setFont(font_bold, 4.8)
+                c.drawString(body_x + 0.5 * mm, ay, f"L{left_deg}°")
+                c.drawRightString(body_x + body_w - 0.5 * mm, ay, f"R{right_deg}°")
+
+            left_detail_no = detail_no
+            if kind != "detail":
+                left_detail_no += 1
             _pdf_strip_card(
-                left_x,
+                left_card_x,
                 ltw,
                 left_tech,
                 left_title,
                 colors.HexColor("#dbeafe"),
             )
-            _pdf_strip_card(
-                seam_x,
-                rtw,
-                right_tech,
-                right_title,
-                colors.HexColor("#dcfce7"),
-            )
-            c.setStrokeColor(colors.HexColor("#0f172a"))
-            c.setLineWidth(0.8)
-            c.setDash(2, 2)
-            c.line(seam_x, ly - 1.0 * mm, seam_x, ly + detail_h + 1.0 * mm)
-            c.setDash()
-            c.setFont(font_bold, 7)
-            c.drawString(left_x + 1.0 * mm, ly - 4 * mm, f"L: {left_left_angle}°")
-            c.drawString(left_x + detail_w - 16 * mm, ly - 4 * mm, f"R: {left_angle}°")
-            c.drawString(seam_x + 1.0 * mm, ly - 4 * mm, f"L: {right_angle}°")
-            c.drawString(seam_x + detail_w - 16 * mm, ly - 4 * mm, f"R: {right_right_angle}°")
-            y = ly - 11 * mm
+            if kind != "detail":
+                right_detail_no = left_detail_no + 1
+                _pdf_strip_card(
+                    seam_x,
+                    rtw,
+                    right_tech,
+                    right_title,
+                    colors.HexColor("#dcfce7"),
+                )
+                detail_no = right_detail_no
+                c.setStrokeColor(colors.HexColor("#0f172a"))
+                c.setLineWidth(0.8)
+                c.setDash(2, 2)
+                c.line(seam_x, ly - 1.0 * mm, seam_x, ly + detail_h + 1.0 * mm)
+                c.setDash()
+            _draw_pdf_angles_in_body(left_card_x, ltw, left_left_angle, left_angle)
+            if kind != "detail":
+                _draw_pdf_angles_in_body(seam_x, rtw, right_angle, right_right_angle)
+            y = row_top - row_h - 1.2 * mm
         c.save()
         QMessageBox.information(self, "Экспорт альбома", f"Сохранено:\n{p}")
 
@@ -1977,23 +2880,35 @@ class MainWindow(QMainWindow):
         if not path or not Path(path).is_file():
             QMessageBox.critical(self, "Ошибка", "Укажите существующий файл .xlsx")
             return
-
-        allowed: set[int] = {d for d, cb in self.profile_checks.items() if cb.isChecked()}
-        if not allowed:
-            QMessageBox.critical(self, "Ошибка", "Отметьте хотя бы один профиль Н20–Н23")
-            return
+        self._load_project_metadata(path)
 
         try:
             kerf = int(self.kerf_edit.text().strip() or "0")
         except ValueError:
-            QMessageBox.critical(self, "Ошибка", "Пропил должен быть целым числом")
+            QMessageBox.critical(self, "Ошибка", "Ширина пропила должна быть целым числом")
+            return
+        offset_90, offset_other, off_err = self._current_offsets()
+        if off_err:
+            QMessageBox.critical(self, "Ошибка", off_err)
             return
         min_scrap = 0
 
         initial_scraps, scrap_warns = self._load_initial_scraps()
         try:
             rows_all, parse_stats = parse_specification_with_stats(path)
-            rows, warns = filter_spec_by_profiles(rows_all, allowed)
+            allowed = self._allowed_profiles(rows_all)
+            allowed_modules = self._allowed_modules()
+            if not allowed_modules:
+                QMessageBox.critical(self, "Ошибка", "По текущему фильтру модулей нет выбранных модулей")
+                return
+            rows_all = [r for r in rows_all if r.module_name in allowed_modules]
+            if not rows_all:
+                QMessageBox.critical(self, "Ошибка", "После фильтра по модулям нет строк")
+                return
+            if not allowed:
+                QMessageBox.critical(self, "Ошибка", "По текущему фильтру профилей нет выбранных профилей")
+                return
+            rows, warns = self._filter_rows_by_selected_profiles(rows_all, allowed)
             logger.info(
                 "Specification loaded: total_rows=%d filtered_rows=%d filtered_out=%d",
                 len(rows_all),
@@ -2031,6 +2946,8 @@ class MainWindow(QMainWindow):
             bars, bars_err = self._selected_bar_lengths(
                 demands,
                 kerf,
+                offset_90,
+                offset_other,
             )
             if bars_err:
                 QMessageBox.critical(self, "Ошибка", bars_err)
@@ -2040,6 +2957,8 @@ class MainWindow(QMainWindow):
                 demands,
                 bar_lengths_mm=bars,
                 kerf_mm=kerf,
+                offset_90_mm=offset_90,
+                offset_other_mm=offset_other,
                 min_scrap_mm=min_scrap,
                 initial_scraps_mm=initial_scraps if initial_scraps else None,
             )
@@ -2075,6 +2994,8 @@ class MainWindow(QMainWindow):
         self._apply_optimization_result(
             result=result,
             kerf_mm=kerf,
+            offset_90_mm=offset_90,
+            offset_other_mm=offset_other,
             chart_metrics=chart_m,
         )
         logger.info(
@@ -2449,17 +3370,26 @@ class MainWindow(QMainWindow):
         if self.table.rowCount() == 0:
             QMessageBox.information(self, "Пересчёт", "Таблица пуста.")
             return
-
-        allowed: set[int] = {d for d, cb in self.profile_checks.items() if cb.isChecked()}
-        if not allowed:
-            QMessageBox.critical(self, "Ошибка", "Отметьте хотя бы один профиль Н20–Н23")
-            return
+        self._load_project_metadata(self.path_edit.text().strip())
 
         try:
             kerf = int(self.kerf_edit.text().strip() or "0")
         except ValueError:
-            QMessageBox.critical(self, "Ошибка", "Пропил должен быть целым числом")
+            QMessageBox.critical(self, "Ошибка", "Ширина пропила должна быть целым числом")
             return
+        offset_90, offset_other, off_err = self._current_offsets()
+        if off_err:
+            QMessageBox.critical(self, "Ошибка", off_err)
+            return
+        allowed: set[int] = set()
+        for code, cb in self.profile_checks.items():
+            if not cb.isChecked():
+                continue
+            digit = parse_profile_series_digit(code)
+            if digit is not None:
+                allowed.add(digit)
+        if not allowed:
+            allowed = set(PROFILE_DIGIT_TO_NAME.keys())
         min_scrap = 0
 
         matrix = self._data_rows_for_recalc()
@@ -2471,6 +3401,8 @@ class MainWindow(QMainWindow):
         bars, bars_err = self._selected_bar_lengths(
             demands,
             kerf,
+            offset_90,
+            offset_other,
         )
         if bars_err:
             QMessageBox.critical(self, "Ошибка", bars_err)
@@ -2481,6 +3413,8 @@ class MainWindow(QMainWindow):
                 demands,
                 bar_lengths_mm=bars,
                 kerf_mm=kerf,
+                offset_90_mm=offset_90,
+                offset_other_mm=offset_other,
                 min_scrap_mm=min_scrap,
                 initial_scraps_mm=initial_scraps if initial_scraps else None,
             )
@@ -2504,6 +3438,8 @@ class MainWindow(QMainWindow):
         self._apply_optimization_result(
             result=result,
             kerf_mm=kerf,
+            offset_90_mm=offset_90,
+            offset_other_mm=offset_other,
             chart_metrics=chart_m,
         )
         logger.info(
@@ -2556,24 +3492,50 @@ class MainWindow(QMainWindow):
     def _profile_color_map(self, names: list[str]) -> dict[str, QColor]:
         """
         Стабильные цвета профилей для обеих диаграмм.
+        Цвет назначается из общего пула под текущую спецификацию, а не по имени профиля.
+        Это снижает пересечения цветов при разных наборах профилей.
         """
-        base: dict[str, QColor] = {
-            "Н20": QColor(59, 130, 246),
-            "Н21": QColor(16, 185, 129),
-            "Н22": QColor(245, 158, 11),
-            "Н23": QColor(168, 85, 247),
-        }
-        palette = [
-            QColor(236, 72, 153),
-            QColor(14, 165, 233),
-            QColor(34, 197, 94),
-            QColor(251, 146, 60),
-            QColor(244, 63, 94),
+        ordered = sorted({n for n in names if n})
+        if not ordered:
+            return {}
+
+        # Расширенный запас контрастных цветов в "инженерной" гамме.
+        palette: list[QColor] = [
+            QColor(16, 87, 153),   # синий
+            QColor(199, 74, 63),   # красный
+            QColor(34, 139, 95),   # зеленый
+            QColor(206, 137, 31),  # янтарный
+            QColor(103, 83, 164),  # фиолетовый
+            QColor(27, 149, 161),  # бирюзовый
+            QColor(186, 82, 124),  # малиновый
+            QColor(117, 131, 74),  # оливковый
+            QColor(60, 120, 189),  # сине-голубой
+            QColor(214, 96, 52),   # терракотовый
+            QColor(50, 156, 122),  # изумрудный
+            QColor(166, 109, 44),  # охра
+            QColor(123, 105, 184), # лавандовый
+            QColor(53, 135, 144),  # морской
+            QColor(171, 96, 145),  # розово-фиолетовый
+            QColor(128, 118, 64),  # болотный
         ]
-        for i, n in enumerate(sorted(names)):
-            if n not in base:
-                base[n] = palette[i % len(palette)]
-        return base
+
+        def _soft(c: QColor) -> QColor:
+            # Осветляем цвет, чтобы диаграммы и PDF были визуально мягче.
+            return QColor(
+                min(255, int(c.red() + (255 - c.red()) * 0.35)),
+                min(255, int(c.green() + (255 - c.green()) * 0.35)),
+                min(255, int(c.blue() + (255 - c.blue()) * 0.35)),
+            )
+
+        out: dict[str, QColor] = {}
+        for i, n in enumerate(ordered):
+            if i < len(palette):
+                out[n] = _soft(palette[i])
+                continue
+            # Если профилей больше палитры — генерируем дополнительные оттенки равномерно.
+            hue = (i * 137) % 360  # шаг "золотого угла" по кругу оттенков
+            out[n] = _soft(QColor.fromHsv(int(hue), 110, 215))
+        return out
 
     def _module_order_key(self, name: str) -> tuple[int, str]:
         m = re.search(r"[MМ]\s*(\d+)", name, flags=re.IGNORECASE)
@@ -2587,7 +3549,13 @@ class MainWindow(QMainWindow):
             return f"М{int(m.group(1))}"
         return name
 
-    def _update_layout_plan(self, cuts: list[CutEvent], kerf_mm: int) -> None:
+    def _update_layout_plan(
+        self,
+        cuts: list[CutEvent],
+        kerf_mm: int,
+        offset_90_mm: int,
+        offset_other_mm: int,
+    ) -> None:
         """Готовит данные для вкладки схемы раскроя (прямоугольники-прутки)."""
         by_opening: dict[int, list[CutEvent]] = defaultdict(list)
         for c in cuts:
@@ -2617,7 +3585,7 @@ class MainWindow(QMainWindow):
                 profile_names.add(profile_name)
                 cut_angle = int(d.cut_angle)
                 right_angle = int(d.cut_angle_2) if d.cut_angle_2 is not None else int(d.cut_angle)
-                tech = 30 if cut_angle == 90 else 50
+                tech = int(offset_90_mm) if cut_angle == 90 else int(offset_other_mm)
                 # Перед каждой деталью: левый тех. отступ + левый пропил (суммарно).
                 left_kerf = int(kerf_mm)
                 segs.append(
@@ -2720,16 +3688,16 @@ class MainWindow(QMainWindow):
                         {
                             "kind": "detail",
                             "opening": opening,
-                            "left_title": f"{self._module_short_name(d.module_name)} {d.profile_code} ({d.length_mm})",
-                            "right_title": f"{self._module_short_name(d.module_name)} {d.profile_code} ({d.length_mm})",
+                            "left_title": f"{self._module_short_name(d.module_name)} {d.profile_code}",
+                            "right_title": "",
                             "left_profile_name": prof,
                             "right_profile_name": prof,
                             "left_right_angle": la,
                             "right_left_angle": ra,
                             "left_left_angle": la,
                             "right_right_angle": ra,
-                            "left_tech_mm": 30 if la == 90 else 50,
-                            "right_tech_mm": 30 if ra == 90 else 50,
+                            "left_tech_mm": self._last_offset_90_mm if la == 90 else self._last_offset_other_mm,
+                            "right_tech_mm": self._last_offset_90_mm if ra == 90 else self._last_offset_other_mm,
                             "kerf_mm": self._last_kerf_mm or 4,
                         }
                     )
@@ -2749,16 +3717,16 @@ class MainWindow(QMainWindow):
                         {
                             "kind": "joint",
                             "opening": opening,
-                            "left_title": f"{self._module_short_name(left.module_name)} {left.profile_code} ({left.length_mm})",
-                            "right_title": f"{self._module_short_name(right.module_name)} {right.profile_code} ({right.length_mm})",
+                            "left_title": f"{self._module_short_name(left.module_name)} {left.profile_code}",
+                            "right_title": f"{self._module_short_name(right.module_name)} {right.profile_code}",
                             "left_profile_name": left_prof,
                             "right_profile_name": right_prof,
                             "left_right_angle": int(left.cut_angle_2) if left.cut_angle_2 is not None else int(left.cut_angle),
                             "right_left_angle": int(right.cut_angle),
                             "left_left_angle": int(left.cut_angle),
                             "right_right_angle": int(right.cut_angle_2) if right.cut_angle_2 is not None else int(right.cut_angle),
-                            "left_tech_mm": 30 if int(left.cut_angle) == 90 else 50,
-                            "right_tech_mm": 30 if int(right.cut_angle) == 90 else 50,
+                            "left_tech_mm": self._last_offset_90_mm if int(left.cut_angle) == 90 else self._last_offset_other_mm,
+                            "right_tech_mm": self._last_offset_90_mm if int(right.cut_angle) == 90 else self._last_offset_other_mm,
                             "kerf_mm": self._last_kerf_mm or 4,
                         }
                     )

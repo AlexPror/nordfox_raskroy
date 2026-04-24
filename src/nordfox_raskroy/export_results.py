@@ -168,6 +168,9 @@ def export_cuts_pdf(
     *,
     summary: str = "",
     title: str = "Раскрой NordFox",
+    project_name: str = "",
+    project_cipher: str = "",
+    logo_path: str | Path | None = None,
 ) -> None:
     path = Path(path)
     try:
@@ -175,7 +178,7 @@ def export_cuts_pdf(
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     except ImportError as e:  # pragma: no cover
         raise ImportError(
             "Для PDF установите: pip install reportlab"
@@ -190,7 +193,22 @@ def export_cuts_pdf(
         bottomMargin=12 * mm,
     )
     styles = getSampleStyleSheet()
-    story: list = [Paragraph(title, styles["Title"]), Spacer(1, 6 * mm)]
+    story: list = []
+    if logo_path:
+        lp = Path(logo_path)
+        if lp.is_file():
+            img = Image(str(lp))
+            img.drawHeight = 8 * mm
+            img.drawWidth = 55.0
+            story.append(img)
+            # Дополнительный "воздух" после логотипа, чтобы шапка PDF читалась легче.
+            story.append(Spacer(1, 24 * mm))
+    story.append(Paragraph(title, styles["Title"]))
+    if project_name.strip():
+        story.append(Paragraph(f"Проект: {project_name.strip()}", styles["Normal"]))
+    if project_cipher.strip():
+        story.append(Paragraph(f"Шифр: {project_cipher.strip()}", styles["Normal"]))
+    story.append(Spacer(1, 6 * mm))
     if summary.strip():
         story.append(Paragraph(summary.replace("\n", "<br/>"), styles["Normal"]))
         story.append(Spacer(1, 6 * mm))

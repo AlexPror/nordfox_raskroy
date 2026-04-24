@@ -10,26 +10,115 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 from nordfox_raskroy.profile_codes import PROFILE_DIGIT_TO_NAME, parse_profile_series_digit
 
+_PROFILE_LIBRARY_PATH = Path(__file__).resolve().parents[2] / "profile_library.json"
+_EDITABLE_PROFILE_CACHE: list[tuple[str, float]] | None = None
+
 # --- NordFox: кг/м по цифре серии (как в nordfox_specification) ---
 # digit 0 → Н20, 1 → Н21, 2 → Н22, 3 → Н23
 SERIES_DIGIT_KG_PER_M: Final[dict[int, float]] = {
-    0: 1.0315,  # H20 / Н20
-    1: 1.206,  # H21 / Н21
-    2: 1.2075,  # H22 / Н22 (экстраполяция в исходном проекте)
-    3: 1.209,  # H23 / Н23
+    0: 0.937,  # H20 / Н20 (актуализировано по согласованной таблице чертежей)
+    1: 1.132,  # H21 / Н21
+    2: 1.358,  # H22 / Н22
+    3: 1.48,  # H23 / Н23
 }
 
-# Дополнительно из того же справочника (не привязаны к цифре СК/СС/Р)
+# Дополнительно по согласованной библиотеке профилей проекта (кг/м).
+# Ключи должны быть в нормализованном виде (см. _norm_text): lower-case, "х" -> "x".
 EXTRA_PROFILES_KG_PER_M: Final[dict[str, float]] = {
-    "dt20": 0.91,
-    "dt21": 0.91,
-    "l15": 0.49,
+    "профиль t35": 0.669,
+    "t35": 0.669,
+    "бокс 80x40x3": 1.854,
+    "профиль dt11": 1.016,
+    "dt11": 1.016,
+    "бокс120x60x3": 2.829,
+    "бокс 120x60x3": 2.829,
+    "профиль t21": 0.696,
+    "t21": 0.696,
+    "бокс 50x50x2": 1.041,
+    "профиль h20": 0.937,
+    "h20": 0.937,
+    "профиль h50": 0.963,
+    "h50": 0.963,
+    "профиль ламели lz10": 0.588,
+    "lz10": 0.588,
+    "профиль h40": 1.138,
+    "h40": 1.138,
+    "профиль t20": 0.494,
+    "t20": 0.494,
+    "профиль t16": 0.686,
+    "t16": 0.686,
+    "профиль dt21": 1.017,
+    "dt21": 1.017,
+    "профиль dt11n": 1.019,
+    "dt11n": 1.019,
+    "профиль dt23": 1.274,
+    "dt23": 1.274,
+    "профиль l20": 0.324,
+    "l20": 0.324,
+    "профиль t11n": 0.428,
+    "t11n": 0.428,
+    "профиль h hat21": 1.295,
+    "h hat21": 1.295,
+    "профиль t22": 0.418,
+    "t22": 0.418,
+    "бокс100x50x2": 1.583,
+    "бокс 100x50x2": 1.583,
+    "профиль t30": 0.259,
+    "t30": 0.259,
+    "профиль dt22": 1.179,
+    "dt22": 1.179,
+    "бокс 200x50x4": 5.246,
+    "профиль dt20": 0.781,
+    "dt20": 0.781,
+    "бокс 25x25x2": 0.499,
+    "профиль h hat24": 1.717,
+    "h hat24": 1.717,
+    "профиль t15": 0.587,
+    "t15": 0.587,
+    "короб светильника lb10": 0.558,
+    "lb10": 0.558,
+    "бокс 80x50x2": 1.366,
+    "профиль h hat23": 1.423,
+    "h hat23": 1.423,
+    "профиль h21": 1.132,
+    "h21": 1.132,
+    "профиль h hat22": 1.377,
+    "h hat22": 1.377,
+    "бокс 80x40x2": 1.257,
+    "бокс150x50x4": 4.162,
+    "бокс 150x50x4": 4.162,
+    "профиль t hat20": 0.761,
+    "t hat20": 0.761,
+    "профиль h hat20": 1.08,
+    "h hat20": 1.08,
+    "профиль h22": 1.358,
+    "h22": 1.358,
+    "профиль h24": 1.691,
+    "h24": 1.691,
+    "профиль dt24": 1.49,
+    "dt24": 1.49,
+    "профиль h23 03.02.2026": 1.48,
+    "профиль h23": 1.48,
+    "h23": 1.48,
+    "бокс 60x50x3": 1.691,
+    "бокс 25x25x1,5": 0.382,
+    "бокс 25x25x1.5": 0.382,
+    "профиль t36": 0.783,
+    "t36": 0.783,
+    "профиль l11n": 0.288,
+    "l11n": 0.288,
+    "профиль l15": 0.42,
+    "l15": 0.42,
+    "профиль l16": 0.489,
+    "l16": 0.489,
     "уголок": 0.49,
 }
 
@@ -124,6 +213,71 @@ def _norm_text(s: str) -> str:
     return t
 
 
+def _default_editable_profiles() -> list[tuple[str, float]]:
+    out: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for key, kg in EXTRA_PROFILES_KG_PER_M.items():
+        if not key.startswith("профиль "):
+            continue
+        display = " ".join(p.capitalize() for p in key.split())
+        if display not in seen:
+            seen.add(display)
+            out.append((display, float(kg)))
+    return sorted(out, key=lambda x: x[0].casefold())
+
+
+def get_editable_profile_entries() -> list[tuple[str, float]]:
+    """Список профилей для редактирования в UI (название, кг/м)."""
+    global _EDITABLE_PROFILE_CACHE
+    if _EDITABLE_PROFILE_CACHE is not None:
+        return list(_EDITABLE_PROFILE_CACHE)
+    if _PROFILE_LIBRARY_PATH.is_file():
+        try:
+            raw = json.loads(_PROFILE_LIBRARY_PATH.read_text(encoding="utf-8"))
+            rows: list[tuple[str, float]] = []
+            if isinstance(raw, list):
+                for it in raw:
+                    if not isinstance(it, dict):
+                        continue
+                    name = str(it.get("name", "")).strip()
+                    try:
+                        kg = float(it.get("kg_per_m", 0))
+                    except Exception:
+                        continue
+                    if name and kg > 0:
+                        rows.append((name, kg))
+            if rows:
+                _EDITABLE_PROFILE_CACHE = rows
+                return list(rows)
+        except Exception:
+            pass
+    _EDITABLE_PROFILE_CACHE = _default_editable_profiles()
+    return list(_EDITABLE_PROFILE_CACHE)
+
+
+def save_editable_profile_entries(entries: list[tuple[str, float]]) -> None:
+    global _EDITABLE_PROFILE_CACHE
+    rows = [(n.strip(), float(v)) for n, v in entries if n.strip() and float(v) > 0]
+    _EDITABLE_PROFILE_CACHE = rows
+    payload = [{"name": n, "kg_per_m": v} for n, v in rows]
+    _PROFILE_LIBRARY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _editable_profile_match_items() -> list[tuple[str, float, str]]:
+    items: list[tuple[str, float, str]] = []
+    for name, kg in get_editable_profile_entries():
+        n = _norm_text(name)
+        if not n:
+            continue
+        items.append((n, kg, name))
+        if n.startswith("профиль "):
+            items.append((n.removeprefix("профиль ").strip(), kg, name))
+    uniq: dict[str, tuple[float, str]] = {}
+    for key, kg, src in items:
+        uniq[key] = (kg, src)
+    return sorted([(k, v[0], v[1]) for k, v in uniq.items()], key=lambda x: len(x[0]), reverse=True)
+
+
 def kg_per_meter_from_description(text: str) -> MassLookup:
     """
     Поиск кг/м по произвольной строке (наименование из спецификации).
@@ -132,6 +286,10 @@ def kg_per_meter_from_description(text: str) -> MassLookup:
     n = _norm_text(text)
     if not n:
         return MassLookup(0.0, "unknown")
+
+    for key, kg, src in _editable_profile_match_items():
+        if key in n:
+            return MassLookup(kg, f"editable_profile:{src}")
 
     for key, kg in EXTRA_PROFILES_KG_PER_M.items():
         if key in n:
@@ -196,6 +354,8 @@ def materials_reference_rows() -> list[tuple[str, str, float, str]]:
         )
     for k, v in sorted(EXTRA_PROFILES_KG_PER_M.items()):
         rows.append(("Профиль доп.", k, v, "nordfox_specification"))
+    for n, kg in get_editable_profile_entries():
+        rows.append(("Профиль (редактируемый)", n, kg, "profile_library.json"))
     for k, v in _ROLLED_RAW:
         rows.append(("Металлопрокат (тип.)", k, v, "ГОСТ/каталог, оценка"))
     return rows
