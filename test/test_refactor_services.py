@@ -6,7 +6,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from nordfox_raskroy.album_plan_service import build_album_plan_rows  # noqa: E402
+from nordfox_raskroy.album_plan_service import build_album_plan_rows, build_scrap_album_rows  # noqa: E402
 from nordfox_raskroy.bar_advisor_service import BarAdvisorResult, run_bar_advisor  # noqa: E402
 from nordfox_raskroy.layout_plan_service import build_layout_plan_rows  # noqa: E402
 from nordfox_raskroy.models import CutEvent, PartDemand, SpecRow  # noqa: E402
@@ -147,6 +147,24 @@ class RefactorServicesTests(unittest.TestCase):
         self.assertEqual(len(joints.rows), 1)
         self.assertIn("Н20", details.profile_names)
         self.assertIn("L15", details.profile_names)
+
+    def test_scrap_album_rows_sorted_and_filtered(self):
+        scrap = build_scrap_album_rows([50, 120, 350, 99, 100], min_length_mm=100)
+        self.assertEqual(len(scrap.rows), 3)
+        kinds = [r.get("kind") for r in scrap.rows]
+        self.assertTrue(all(k == "scrap" for k in kinds))
+        lengths = [int(r.get("length_mm", 0)) for r in scrap.rows]
+        self.assertEqual(lengths, [350, 120, 100])
+        self.assertEqual(int(scrap.rows[0].get("max_length_mm", 0)), 350)
+
+    def test_scrap_album_as_stock_order(self):
+        scrap = build_scrap_album_rows(
+            [200, 450, 150],
+            min_length_mm=100,
+            sort_mode="as_stock",
+        )
+        lengths = [int(r.get("length_mm", 0)) for r in scrap.rows]
+        self.assertEqual(lengths, [200, 450, 150])
 
 
 if __name__ == "__main__":

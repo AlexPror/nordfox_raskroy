@@ -61,7 +61,11 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 from nordfox_raskroy.bar_advisor_service import run_bar_advisor
-from nordfox_raskroy.album_plan_service import build_album_plan_rows
+from nordfox_raskroy.album_plan_service import (
+    SCRAP_SORT_MODES,
+    build_album_plan_rows,
+    build_scrap_album_rows,
+)
 from nordfox_raskroy.excel_io import (
     parse_project_metadata,
     parse_specification,
@@ -70,7 +74,6 @@ from nordfox_raskroy.excel_io import (
 from nordfox_raskroy.export_results import export_cuts_excel, export_cuts_pdf
 from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
 from nordfox_raskroy.module_names import module_order_key
-from nordfox_raskroy.module_colors import module_row_rgb
 from nordfox_raskroy.optimizer import (
     demand_cut_length_mm,
     format_cut_angles,
@@ -100,7 +103,6 @@ from nordfox_raskroy.spec_profile_filters import (
     profile_filter_key,
 )
 from nordfox_raskroy import __version__
-from nordfox_raskroy.table_demand_import import demands_from_cut_table_rows
 logger = logging.getLogger("nordfox_raskroy.qt_app")
 
 # Техзона и пропил на схеме — отдельные цвета; углы только подписью, без линий на профиле.
@@ -700,18 +702,21 @@ class JointAlbumWidget(QWidget):
         if not self._rows:
             p.setPen(QColor(51, 65, 85))
             p.setFont(QFont("Segoe UI", 9))
-            p.drawText(14, 28, "Нет данных для альбома стыков")
+            p.drawText(14, 28, "Нет данных для альбома")
             return
 
         y = 32.0
         row_h = 76.0
         caption_w = 260.0
         detail_h = 34.0
-        p.setPen(QColor(30, 41, 59))
-        p.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        p.drawText(14, 20, "Легенда цветов профилей:")
-        lx = 190.0
-        p.setFont(QFont("Segoe UI", 8))
+        if self._color_map:
+            p.setPen(QColor(30, 41, 59))
+            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            p.drawText(14, 20, "Легенда цветов профилей:")
+            lx = 190.0
+            p.setFont(QFont("Segoe UI", 8))
+        else:
+            lx = 14.0
         for name in sorted(self._color_map):
             c = self._color_map[name]
             p.setPen(QColor(148, 163, 184))
@@ -840,8 +845,60 @@ class JointAlbumWidget(QWidget):
         joint_no = 0
         detail_no = 0
         for r in self._rows:
-            opening = int(r.get("opening", 0))
             kind = str(r.get("kind", "joint"))
+            if kind == "scrap":
+                length_mm = int(r.get("length_mm", 0))
+                scrap_no = int(r.get("scrap_no", 0))
+                max_len = max(int(r.get("max_length_mm", length_mm)), 1)
+                block = QRectF(8, y, self.width() - 16, row_h)
+                p.setPen(QPen(QColor(203, 213, 225), 1.0))
+                p.setBrush(QColor(255, 255, 255))
+                p.drawRoundedRect(block, 6, 6)
+                caption_rect = QRectF(block.left() + 4, y + 4, caption_w, block.height() - 8)
+                p.setPen(QPen(QColor(203, 213, 225), 1.0))
+                p.setBrush(QColor(248, 250, 252))
+                p.drawRoundedRect(caption_rect, 4, 4)
+                p.setPen(QColor(30, 41, 59))
+                p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                p.drawText(
+                    caption_rect.adjusted(8, 6, -8, -6),
+                    int(Qt.AlignLeft | Qt.AlignTop),
+                    f"Остаток №{scrap_no}",
+                )
+                p.setFont(QFont("Segoe UI", 8))
+                p.setPen(QColor(71, 85, 105))
+                p.drawText(
+                    caption_rect.adjusted(8, 22, -8, -6),
+                    int(Qt.AlignLeft | Qt.AlignTop),
+                    "кусок на складе",
+                )
+                drawing_rect = QRectF(
+                    caption_rect.right() + 6,
+                    block.top() + 4,
+                    block.right() - (caption_rect.right() + 10),
+                    block.height() - 8,
+                )
+                p.setPen(QPen(QColor(226, 232, 240), 1.0))
+                p.setBrush(QColor(255, 255, 255))
+                p.drawRoundedRect(drawing_rect, 4, 4)
+                frac = min(1.0, float(length_mm) / float(max_len))
+                bar_w = max(8.0, (drawing_rect.width() - 16.0) * frac)
+                bar_h = 26.0
+                bar_y = drawing_rect.center().y() - bar_h / 2.0
+                bar_rect = QRectF(drawing_rect.left() + 8.0, bar_y, bar_w, bar_h)
+                p.setPen(QPen(QColor(148, 163, 184), 1.0))
+                p.setBrush(QColor(226, 232, 240))
+                p.drawRoundedRect(bar_rect, 3.0, 3.0)
+                p.setPen(QColor(30, 41, 59))
+                p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                p.drawText(
+                    drawing_rect.adjusted(10, 0, -10, 0),
+                    int(Qt.AlignCenter),
+                    f"{length_mm} мм",
+                )
+                y += row_h + 10.0
+                continue
+            opening = int(r.get("opening", 0))
             left_title = str(r.get("left_title", ""))
             right_title = str(r.get("right_title", ""))
             left_profile = str(r.get("left_profile_name", ""))
@@ -1049,6 +1106,7 @@ class MainWindow(QMainWindow):
         self._last_kerf_mm: int = 0
         self._last_offset_90_mm: int = 30
         self._last_offset_other_mm: int = 50
+        self._last_final_scraps_mm: list[int] = []
         self._project_name: str = ""
         self._project_cipher: str = ""
         self._layout_rows: list[dict[str, object]] = []
@@ -1230,21 +1288,21 @@ class MainWindow(QMainWindow):
         opt_grid = QGridLayout(opt_fr)
         opt_grid.setHorizontalSpacing(8)
         opt_grid.setVerticalSpacing(6)
-        opt_grid.addWidget(QLabel("Ширина пропила, мм:"), 0, 0)
-        self.kerf_edit = QLineEdit("0")
-        self.kerf_edit.setMaximumWidth(72)
-        self._bind_line_edit_undo_redo(self.kerf_edit)
-        opt_grid.addWidget(self.kerf_edit, 0, 1)
-        opt_grid.addWidget(QLabel("Тех. отступ 90°, мм:"), 0, 2)
+        opt_grid.addWidget(QLabel("Тех. отступ 90°, мм:"), 0, 0)
         self.tech_90_edit = QLineEdit("30")
         self.tech_90_edit.setMaximumWidth(72)
         self._bind_line_edit_undo_redo(self.tech_90_edit)
-        opt_grid.addWidget(self.tech_90_edit, 0, 3)
-        opt_grid.addWidget(QLabel("Тех. отступ прочие углы, мм:"), 1, 0, 1, 2)
+        opt_grid.addWidget(self.tech_90_edit, 0, 1)
+        opt_grid.addWidget(QLabel("Тех. отступ прочие углы, мм:"), 0, 2)
         self.tech_other_edit = QLineEdit("50")
         self.tech_other_edit.setMaximumWidth(72)
         self._bind_line_edit_undo_redo(self.tech_other_edit)
-        opt_grid.addWidget(self.tech_other_edit, 1, 2)
+        opt_grid.addWidget(self.tech_other_edit, 0, 3)
+        opt_grid.addWidget(QLabel("Ширина пропила, мм:"), 1, 0)
+        self.kerf_edit = QLineEdit("0")
+        self.kerf_edit.setMaximumWidth(72)
+        self._bind_line_edit_undo_redo(self.kerf_edit)
+        opt_grid.addWidget(self.kerf_edit, 1, 1)
         left_layout.addWidget(opt_fr)
         tech_rule = QLabel("Тех. отступ берется по 1-му углу детали, ширина пропила учитывается как 2xпропил.")
         tech_rule.setStyleSheet("color: #475569;")
@@ -1258,16 +1316,6 @@ class MainWindow(QMainWindow):
             lambda _=False: self._run_with_loader("Расчет раскроя...", self._compute)
         )
         calc_row.addWidget(run_btn, 1)
-        self.btn_recalc = QPushButton("Пересчитать раскрой по таблице")
-        self.btn_recalc.setToolTip(
-            "Учитываются колонки: модуль, тип профиля, длина, угол. "
-            "Колонка «Масса» только для отображения. Остальные после пересчёта обновятся."
-        )
-        self.btn_recalc.clicked.connect(
-            lambda _=False: self._run_with_loader("Пересчет...", self._recalc_from_table)
-        )
-        self.btn_recalc.setEnabled(False)
-        calc_row.addWidget(self.btn_recalc, 1)
         btn_adv = QPushButton("Подобрать оптимальную длину заготовки")
         btn_adv.setToolTip(
             "Сравнивает типовые наборы длин (только 6 м, только 7,5 м, комбинации…); "
@@ -1317,7 +1365,7 @@ class MainWindow(QMainWindow):
         self.sort_combo = QComboBox()
         for mode_id, label in SORT_MODES:
             self.sort_combo.addItem(label, mode_id)
-        self.sort_combo.currentIndexChanged.connect(self._apply_sort)
+        self.sort_combo.currentIndexChanged.connect(self._apply_table_sort)
         sort_row.addWidget(self.sort_combo, stretch=1)
         self.btn_xlsx = QPushButton("Экспорт Excel…")
         self.btn_xlsx.clicked.connect(
@@ -1389,6 +1437,15 @@ class MainWindow(QMainWindow):
         )
         plan_btns.addWidget(self.btn_layout_pdf)
         plan_btns.addStretch(1)
+        layout_sort_row = QHBoxLayout()
+        layout_sort_row.addWidget(QLabel("Сортировка схемы:"))
+        self.layout_sort_combo = QComboBox()
+        for mode_id, label in SORT_MODES:
+            self.layout_sort_combo.addItem(label, mode_id)
+        self.layout_sort_combo.setMinimumWidth(280)
+        self.layout_sort_combo.currentIndexChanged.connect(self._apply_layout_sort)
+        layout_sort_row.addWidget(self.layout_sort_combo, stretch=1)
+        layout_tab_l.addLayout(layout_sort_row)
         self.layout_hint = QLabel(
             "Сегменты: техотступ (оранж.) — мм над полосой; пропил (бирюза), вертикальная полоса; профиль — цвет серии. "
             "Углы только подписью (L/R). Пунктир: деталь из обрезка. Узкие сегменты — метки #N в таблице ниже."
@@ -1434,11 +1491,12 @@ class MainWindow(QMainWindow):
         self.album_mode_combo = QComboBox()
         self.album_mode_combo.addItem("Стыки", "joints")
         self.album_mode_combo.addItem("Детали", "details")
+        self.album_mode_combo.addItem("Остатки ≥100 мм", "scraps")
         self.album_mode_combo.setToolTip(
             "Стыки: соседние детали в месте стыка.\n"
-            "Детали: контрольная карточка каждой отдельной детали с ее углами, техотступом и пропилом."
+            "Детали: контрольная карточка каждой отдельной детали с ее углами, техотступом и пропилом.\n"
+            "Остатки: куски на складе после раскроя не короче 100 мм (по убыванию длины)."
         )
-        self.album_mode_combo.currentIndexChanged.connect(self._refresh_album)
         album_btns.addWidget(self.album_mode_combo)
         self.btn_album_pdf = QPushButton("Экспорт альбома PDF…")
         self.btn_album_pdf.setEnabled(False)
@@ -1447,8 +1505,28 @@ class MainWindow(QMainWindow):
         )
         album_btns.addWidget(self.btn_album_pdf)
         album_btns.addStretch(1)
+        album_sort_row = QHBoxLayout()
+        self.album_sort_label = QLabel("Сортировка стыков / деталей:")
+        self.album_sort_combo = QComboBox()
+        for mode_id, label in SORT_MODES:
+            self.album_sort_combo.addItem(label, mode_id)
+        self.album_sort_combo.setMinimumWidth(260)
+        self.album_sort_combo.currentIndexChanged.connect(self._apply_album_sort)
+        self.scrap_sort_label = QLabel("Сортировка остатков:")
+        self.scrap_sort_combo = QComboBox()
+        for mode_id, label in SCRAP_SORT_MODES:
+            self.scrap_sort_combo.addItem(label, mode_id)
+        self.scrap_sort_combo.setMinimumWidth(240)
+        self.scrap_sort_combo.currentIndexChanged.connect(self._apply_album_sort)
+        album_sort_row.addWidget(self.album_sort_label)
+        album_sort_row.addWidget(self.album_sort_combo, stretch=1)
+        album_sort_row.addWidget(self.scrap_sort_label)
+        album_sort_row.addWidget(self.scrap_sort_combo, stretch=1)
+        album_l.addLayout(album_sort_row)
+        self.album_mode_combo.currentIndexChanged.connect(self._on_album_mode_changed)
+        self._sync_album_sort_controls()
         album_hint = QLabel(
-            "Крупный план стыков: каждая строка показывает соседние детали и геометрию углов на общем резе."
+            "Стыки и детали — своя сортировка списка; остатки — куски ≥100 мм после проекта, отдельная сортировка длин."
         )
         album_hint.setStyleSheet("color: #475569;")
         album_l.addWidget(album_hint)
@@ -1931,24 +2009,17 @@ class MainWindow(QMainWindow):
         Обновляет раскрой, схему, альбом и массовые метрики синхронно.
         """
         self._optimizer_cuts = list(result.cuts)
+        self._last_final_scraps_mm = list(result.final_scraps_mm)
         self._last_kerf_mm = kerf_mm
         self._last_offset_90_mm = offset_90_mm
         self._last_offset_other_mm = offset_other_mm
         self.btn_xlsx.setEnabled(True)
         self.btn_pdf.setEnabled(True)
-        self.btn_recalc.setEnabled(True)
         self.btn_layout_xlsx.setEnabled(True)
         self.btn_layout_pdf.setEnabled(True)
         self.btn_album_pdf.setEnabled(True)
-        self._update_layout_plan(
-            result.cuts,
-            kerf_mm=kerf_mm,
-            offset_90_mm=offset_90_mm,
-            offset_other_mm=offset_other_mm,
-        )
-        self._update_album_plan(result.cuts)
         self._apply_chart_metrics(chart_metrics)
-        self._apply_sort()
+        self._refresh_all_result_views()
 
     def _populate_layout_overflow_table(self, rows: list[dict[str, object]]) -> None:
         self.layout_overflow_table.setRowCount(0)
@@ -1972,12 +2043,29 @@ class MainWindow(QMainWindow):
                 it.setBackground(bg)
                 self.layout_overflow_table.setItem(row, c, it)
 
+    def _on_album_mode_changed(self) -> None:
+        self._sync_album_sort_controls()
+        self._refresh_album()
+
+    def _sync_album_sort_controls(self) -> None:
+        if not hasattr(self, "album_mode_combo"):
+            return
+        scraps = self.album_mode_combo.currentData() == "scraps"
+        self.album_sort_label.setVisible(not scraps)
+        self.album_sort_combo.setVisible(not scraps)
+        self.scrap_sort_label.setVisible(scraps)
+        self.scrap_sort_combo.setVisible(scraps)
+
     def _refresh_album(self) -> None:
+        mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
+        if mode == "scraps":
+            self._update_album_plan([])
+            return
         if not self._optimizer_cuts:
             self.album_widget.clear_rows()
             self._album_rows = []
             return
-        self._update_album_plan(self._optimizer_cuts)
+        self._update_album_plan(self._sorted_display_cuts_album())
 
     def _browse_scrap(self) -> None:
         base = self.scrap_path_edit.text().strip()
@@ -2532,7 +2620,13 @@ class MainWindow(QMainWindow):
 
     def _export_album_pdf(self) -> None:
         if not self._album_rows:
-            QMessageBox.information(self, "Экспорт альбома", "Сначала выполните расчёт.")
+            am = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
+            msg = (
+                "Нет остатков не короче 100 мм после последнего расчёта."
+                if am == "scraps"
+                else "Сначала выполните расчёт."
+            )
+            QMessageBox.information(self, "Экспорт альбома", msg)
             return
         default = Path(self.path_edit.text() or "layout").with_name("raskroy_album_a4.pdf")
         p, _ = QFileDialog.getSaveFileName(self, "Сохранить PDF-альбом", str(default), "PDF (*.pdf)")
@@ -2549,6 +2643,14 @@ class MainWindow(QMainWindow):
         font_regular, font_bold = reportlab_cyrillic_fonts(logger)
         c = canvas.Canvas(str(Path(p)), pagesize=A4)
         pw, ph = A4
+        amode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
+        if amode == "scraps":
+            album_title = "Альбом остатков ≥100 мм (A4, вертикально)"
+        elif amode == "details":
+            album_title = "Альбом деталей (A4, вертикально)"
+        else:
+            album_title = "Альбом стыков (A4, вертикально)"
+
         def _draw_pdf_header() -> float:
             y0 = ph - 12 * mm
             if _LOGO_PATH.is_file():
@@ -2559,7 +2661,7 @@ class MainWindow(QMainWindow):
             c.setFillColor(colors.black)
             header_x = 50 * mm
             c.setFont(font_bold, 11)
-            c.drawString(header_x, y0, "Альбом стыков (A4, вертикально)")
+            c.drawString(header_x, y0, album_title)
             c.setFont(font_regular, 8)
             c.drawString(header_x, y0 - 4 * mm, f"Проект: {self._project_name or '—'}")
             c.drawString(header_x, y0 - 8 * mm, f"Шифр: {self._project_cipher or '—'}")
@@ -2577,8 +2679,27 @@ class MainWindow(QMainWindow):
             if y < 20 * mm:
                 c.showPage()
                 y = _draw_pdf_header()
-            opening = int(r.get("opening", 0))
             kind = str(r.get("kind", "joint"))
+            if kind == "scrap":
+                length_mm = int(r.get("length_mm", 0))
+                scrap_no = int(r.get("scrap_no", 0))
+                row_top = y
+                row_left = 11.5 * mm
+                row_w = pw - 23.0 * mm
+                c.setStrokeColor(colors.HexColor("#cbd5e1"))
+                c.setFillColor(colors.HexColor("#f1f5f9"))
+                c.setLineWidth(0.6)
+                c.roundRect(row_left, row_top - row_h, row_w, row_h, 2.0 * mm, stroke=1, fill=1)
+                c.setFillColor(colors.black)
+                c.setFont(font_bold, 8)
+                c.drawString(
+                    row_left + 2 * mm,
+                    row_top - (row_h / 2.0) + 1 * mm,
+                    f"Остаток №{scrap_no}: {length_mm} мм",
+                )
+                y = row_top - row_h - 1.2 * mm
+                continue
+            opening = int(r.get("opening", 0))
             left_title = str(r.get("left_title", ""))
             right_title = str(r.get("right_title", ""))
             left_angle = int(r.get("left_right_angle", 90))
@@ -2809,12 +2930,13 @@ class MainWindow(QMainWindow):
                 )
                 self._last_sorted_cuts = None
                 self._optimizer_cuts = None
+                self._last_final_scraps_mm = []
                 self._last_summary_text = ""
                 self.btn_xlsx.setEnabled(False)
                 self.btn_pdf.setEnabled(False)
-                self.btn_recalc.setEnabled(False)
                 self.btn_layout_xlsx.setEnabled(False)
                 self.btn_layout_pdf.setEnabled(False)
+                self.btn_album_pdf.setEnabled(False)
                 self.mass_chart.clear_data()
                 self.waste_chart.clear_data()
                 self.layout_widget.clear_plan()
@@ -2891,15 +3013,64 @@ class MainWindow(QMainWindow):
                 f"Исключено строк: {len(warns)}. Подробности — в сводке ниже.",
             )
 
-    def _apply_sort(self) -> None:
-        if not self._optimizer_cuts:
-            return
-        mode = self.sort_combo.currentData()
+    def _sort_mode_from_combo(self, combo: QComboBox) -> str:
+        mode = combo.currentData()
         if not isinstance(mode, str):
-            mode = "opening"
-        cuts = sort_cuts(self._optimizer_cuts, mode)
+            return "opening"
+        return mode
+
+    def _sorted_display_cuts_table(self) -> list[CutEvent]:
+        if not self._optimizer_cuts:
+            return []
+        return sort_cuts(self._optimizer_cuts, self._sort_mode_from_combo(self.sort_combo))
+
+    def _sorted_display_cuts_layout(self) -> list[CutEvent]:
+        if not self._optimizer_cuts:
+            return []
+        return sort_cuts(self._optimizer_cuts, self._sort_mode_from_combo(self.layout_sort_combo))
+
+    def _sorted_display_cuts_album(self) -> list[CutEvent]:
+        if not self._optimizer_cuts:
+            return []
+        return sort_cuts(self._optimizer_cuts, self._sort_mode_from_combo(self.album_sort_combo))
+
+    def _apply_table_sort(self) -> None:
+        if not self._optimizer_cuts:
+            self._last_sorted_cuts = None
+            self.table.setRowCount(0)
+            return
+        cuts = self._sorted_display_cuts_table()
         self._last_sorted_cuts = cuts
         self._populate_table(cuts)
+
+    def _apply_layout_sort(self) -> None:
+        if not self._optimizer_cuts:
+            self._layout_rows = []
+            self.layout_widget.clear_plan()
+            return
+        cuts = self._sorted_display_cuts_layout()
+        self._update_layout_plan(
+            cuts,
+            kerf_mm=self._last_kerf_mm or 0,
+            offset_90_mm=self._last_offset_90_mm,
+            offset_other_mm=self._last_offset_other_mm,
+        )
+
+    def _apply_album_sort(self) -> None:
+        self._refresh_album()
+
+    def _refresh_all_result_views(self) -> None:
+        if not self._optimizer_cuts:
+            self._last_sorted_cuts = None
+            self.table.setRowCount(0)
+            self._layout_rows = []
+            self.layout_widget.clear_plan()
+            self.album_widget.clear_rows()
+            self._album_rows = []
+            return
+        self._apply_table_sort()
+        self._apply_layout_sort()
+        self._refresh_album()
 
     def _populate_table(self, cuts: list[CutEvent]) -> None:
         logger.info("populate_table start: cuts=%d", len(cuts))
@@ -2909,6 +3080,8 @@ class MainWindow(QMainWindow):
         total_kg = 0.0
         mass_by_profile: dict[str, float] = defaultdict(float)
         any_mass = False
+        profile_labels = {display_profile_name(c.demand.profile_code) for c in cuts}
+        row_palette = self._profile_color_map(sorted(profile_labels))
         for cut in cuts:
             d = cut.demand
             row = self.table.rowCount()
@@ -2935,17 +3108,19 @@ class MainWindow(QMainWindow):
                 str(cut.remainder_mm),
                 mtxt,
             ]
-            rgb = module_row_rgb(
-                d.module_name,
-                is_scrap=cut.stock_source == "scrap",
-            )
-            bg = QColor(*rgb)
+            prof_name = display_profile_name(d.profile_code)
+            base = row_palette.get(prof_name, QColor(226, 232, 240))
+            if cut.stock_source == "scrap":
+                bg = QColor(
+                    min(255, int(base.red() * 0.82)),
+                    min(255, int(base.green() * 0.82)),
+                    min(255, int(base.blue() * 0.82)),
+                )
+            else:
+                bg = base
             for col, text in enumerate(vals):
                 it = QTableWidgetItem(text)
-                flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-                if col != 9:
-                    flags |= Qt.ItemIsEditable
-                it.setFlags(flags)
+                it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 it.setBackground(bg)
                 self.table.setItem(row, col, it)
             logger.info(
@@ -3139,18 +3314,6 @@ class MainWindow(QMainWindow):
         self._set_table_zoom(self._table_zoom)
         logger.info("populate_table done: total_rows=%d", self.table.rowCount())
 
-    def _data_rows_for_recalc(self) -> list[list[str]]:
-        """Колонки «Модуль»…«Остаток» (без «Пруток №» и массы), без строки «Итого»."""
-        end = self._data_row_count
-        rows: list[list[str]] = []
-        for r in range(end):
-            row: list[str] = []
-            for c in range(1, 9):
-                it = self.table.item(r, c)
-                row.append(it.text().strip() if it is not None else "")
-            rows.append(row)
-        return rows
-
     def _copy_table_selection(self) -> bool:
         """Копировать выделенный фрагмент таблицы (TSV) в буфер обмена."""
         ranges = self.table.selectedRanges()
@@ -3240,89 +3403,6 @@ class MainWindow(QMainWindow):
         act_copy.triggered.connect(self._copy_table_selection)
         menu.addAction(act_copy)
         menu.exec(self.table.viewport().mapToGlobal(pos))
-
-    def _recalc_from_table(self) -> None:
-        logger.info("Recalc from table requested")
-        if self.table.rowCount() == 0:
-            QMessageBox.information(self, "Пересчёт", "Таблица пуста.")
-            return
-        self._load_project_metadata(self.path_edit.text().strip())
-
-        try:
-            kerf = int(self.kerf_edit.text().strip() or "0")
-        except ValueError:
-            QMessageBox.critical(self, "Ошибка", "Ширина пропила должна быть целым числом")
-            return
-        offset_90, offset_other, off_err = self._current_offsets()
-        if off_err:
-            QMessageBox.critical(self, "Ошибка", off_err)
-            return
-        allowed: set[int] = set()
-        for code, cb in self.profile_checks.items():
-            if not cb.isChecked():
-                continue
-            digit = parse_profile_series_digit(code)
-            if digit is not None:
-                allowed.add(digit)
-        if not allowed:
-            allowed = set(PROFILE_DIGIT_TO_NAME.keys())
-        min_scrap = 0
-
-        matrix = self._data_rows_for_recalc()
-        demands, err = demands_from_cut_table_rows(matrix, allowed)
-        if err or demands is None:
-            QMessageBox.critical(self, "Таблица", err or "Ошибка разбора таблицы")
-            return
-        initial_scraps, _sw = self._load_initial_scraps()
-        bars, bars_err = self._selected_bar_lengths(
-            demands,
-            kerf,
-            offset_90,
-            offset_other,
-        )
-        if bars_err:
-            QMessageBox.critical(self, "Ошибка", bars_err)
-            return
-        logger.info("Recalc demands parsed: count=%d", len(demands))
-        try:
-            result = optimize_cutting(
-                demands,
-                bar_lengths_mm=bars,
-                kerf_mm=kerf,
-                offset_90_mm=offset_90,
-                offset_other_mm=offset_other,
-                min_scrap_mm=min_scrap,
-                initial_scraps_mm=initial_scraps if initial_scraps else None,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Recalc failed")
-            QMessageBox.critical(self, "Пересчёт", str(e))
-            return
-
-        summary_lines = [summarize(result)]
-        summary_lines.extend(self._mass_summary_lines(result.cuts))
-        note = (
-            "\n\n(Пересчёт по отредактированной таблице; "
-            "колонки «Серия», «Источник», «Заготовка», «Остаток» обновлены.)"
-        )
-        full = "\n".join(summary_lines) + note
-        chart_m = self._compute_chart_metrics(result)
-        if chart_m is not None:
-            full += "\n\n" + "\n".join(self._chart_summary_lines(chart_m))
-        self.advisor_text.setPlainText(full)
-        self._last_summary_text = full
-        self._apply_optimization_result(
-            result=result,
-            kerf_mm=kerf,
-            offset_90_mm=offset_90,
-            offset_other_mm=offset_other,
-            chart_metrics=chart_m,
-        )
-        logger.info(
-            "Recalc completed: cuts=%d new_bars=%d",
-            len(result.cuts),
-            sum(result.bars_used.values()),
-        )
 
     def _mass_summary_lines(self, cuts: list[CutEvent]) -> list[str]:
         """
@@ -3440,6 +3520,22 @@ class MainWindow(QMainWindow):
 
     def _update_album_plan(self, cuts: list[CutEvent]) -> None:
         mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
+        if mode == "scraps":
+            sm = self.scrap_sort_combo.currentData() if hasattr(self, "scrap_sort_combo") else "length_desc"
+            if not isinstance(sm, str):
+                sm = "length_desc"
+            scrap_plan = build_scrap_album_rows(
+                self._last_final_scraps_mm or [],
+                min_length_mm=100,
+                sort_mode=sm,
+            )
+            self._album_rows = scrap_plan.rows
+            self.album_widget.set_rows(scrap_plan.rows, {})
+            return
+        if not cuts:
+            self._album_rows = []
+            self.album_widget.clear_rows()
+            return
         album_plan = build_album_plan_rows(
             cuts,
             mode=("details" if mode == "details" else "joints"),

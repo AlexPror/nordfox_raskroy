@@ -8,7 +8,14 @@ from nordfox_raskroy.models import CutEvent
 from nordfox_raskroy.module_names import module_short_name
 from nordfox_raskroy.profile_names import display_profile_name
 
-AlbumMode = Literal["details", "joints"]
+AlbumMode = Literal["details", "joints", "scraps"]
+
+# id для QComboBox — только альбом остатков
+SCRAP_SORT_MODES: list[tuple[str, str]] = [
+    ("length_desc", "Длина, мм ↓"),
+    ("length_asc", "Длина, мм ↑"),
+    ("as_stock", "Порядок расчёта (склад)"),
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,3 +91,33 @@ def build_album_plan_rows(
                     }
                 )
     return AlbumPlanResult(rows=rows, profile_names=profile_names)
+
+
+def build_scrap_album_rows(
+    final_scraps_mm: list[int],
+    *,
+    min_length_mm: int = 100,
+    sort_mode: str = "length_desc",
+) -> AlbumPlanResult:
+    """Остатки на складе после раскроя: только длины ≥ min_length_mm."""
+    lo = int(min_length_mm)
+    m = (sort_mode or "length_desc").strip().lower()
+    raw = [int(x) for x in final_scraps_mm]
+    filtered = [x for x in raw if x >= lo]
+    if m == "length_asc":
+        lengths = sorted(filtered)
+    elif m == "as_stock":
+        lengths = [x for x in raw if x >= lo]
+    else:
+        lengths = sorted(filtered, reverse=True)
+    max_len = max(lengths) if lengths else 1
+    rows: list[dict[str, object]] = [
+        {
+            "kind": "scrap",
+            "length_mm": ln,
+            "scrap_no": i + 1,
+            "max_length_mm": max_len,
+        }
+        for i, ln in enumerate(lengths)
+    ]
+    return AlbumPlanResult(rows=rows, profile_names=set())
