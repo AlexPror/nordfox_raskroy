@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from collections import defaultdict
 import logging
+from datetime import datetime
 from pathlib import Path
 import re
 
@@ -61,18 +62,28 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 from nordfox_raskroy.bar_advisor_service import run_bar_advisor
-from nordfox_raskroy.album_plan_service import (
-    SCRAP_SORT_MODES,
-    build_album_plan_rows,
-    build_scrap_album_rows,
+from nordfox_raskroy.shop_floor_progress import (
+    BarProgressRow,
+    ShopFloorSession,
+    duration_minutes,
+    load_session,
+    merge_progress,
+    progress_by_opening,
+    save_session,
 )
+from nordfox_raskroy.usable_remnants_service import (
+    MIN_USABLE_REMNANT_MM,
+    REMNANT_SORT_MODES,
+    build_usable_remnant_rows,
+)
+from nordfox_raskroy.usable_remnants_widget import UsableRemnantsWidget
 from nordfox_raskroy.excel_io import (
     parse_project_metadata,
     parse_specification,
     parse_specification_with_stats,
 )
 from nordfox_raskroy.export_results import export_cuts_excel, export_cuts_pdf
-from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
+from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow, StockScrapPiece
 from nordfox_raskroy.module_names import module_order_key
 from nordfox_raskroy.optimizer import (
     demand_cut_length_mm,
@@ -672,319 +683,6 @@ class CuttingLayoutWidget(QWidget):
             y += card_h + row_gap_below_bar
 
 
-class JointAlbumWidget(QWidget):
-    """Крупный альбом стыков соседних деталей."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._rows: list[dict[str, object]] = []
-        self._color_map: dict[str, QColor] = {}
-        self.setMinimumHeight(280)
-
-    def set_rows(self, rows: list[dict[str, object]], color_map: dict[str, QColor]) -> None:
-        self._rows = rows
-        self._color_map = color_map
-        row_h = 86
-        self.setMinimumHeight(max(260, 28 + len(rows) * row_h))
-        self.setMinimumWidth(720)
-        self.updateGeometry()
-        self.update()
-
-    def clear_rows(self) -> None:
-        self._rows = []
-        self.setMinimumHeight(280)
-        self.update()
-
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), QColor(248, 250, 252))
-        if not self._rows:
-            p.setPen(QColor(51, 65, 85))
-            p.setFont(QFont("Segoe UI", 9))
-            p.drawText(14, 28, "Нет данных для альбома")
-            return
-
-        y = 32.0
-        row_h = 76.0
-        caption_w = 260.0
-        detail_h = 34.0
-        if self._color_map:
-            p.setPen(QColor(30, 41, 59))
-            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
-            p.drawText(14, 20, "Легенда цветов профилей:")
-            lx = 190.0
-            p.setFont(QFont("Segoe UI", 8))
-        else:
-            lx = 14.0
-        for name in sorted(self._color_map):
-            c = self._color_map[name]
-            p.setPen(QColor(148, 163, 184))
-            p.setBrush(c)
-            p.drawRect(QRectF(lx, 12, 10, 10))
-            p.setPen(QColor(30, 41, 59))
-            p.drawText(int(lx + 14), 21, name)
-            lx += 78.0
-
-        def _draw_detail(
-            rect: QRectF,
-            fill_color: QColor,
-            title: str,
-            left_angle_deg: int,
-            right_angle_deg: int,
-            tech_mm: int,
-            kerf_mm: int,
-        ) -> None:
-            yt = rect.top()
-            yb = rect.bottom()
-            # Левый техотступ и вертикальный пропил; справа — только пропил (схема 1D).
-            ltw = 16.0 if tech_mm == 50 else 10.0
-            kw = 6.0 if kerf_mm >= 4 else 4.0
-            left_zone_end = rect.left() + ltw + kw
-            right_zone_start = rect.right() - kw
-
-            tech_rect = QRectF(rect.left(), yt, ltw, rect.height())
-            kerf_l = QRectF(rect.left() + ltw, yt, kw, rect.height())
-            kerf_r = QRectF(right_zone_start, yt, rect.right() - right_zone_start, rect.height())
-            body = QRectF(left_zone_end, yt, right_zone_start - left_zone_end, rect.height())
-
-            p.setPen(QPen(QColor(241, 245, 249), 1.0))
-            p.setBrush(fill_color)
-            p.drawRect(rect)
-
-            _paint_diagonal_hatch(
-                p,
-                QPolygonF(tech_rect),
-                fill=_TECH_VIS_FILL,
-                line_color=_TECH_VIS_LINE,
-                spacing=4.0,
-                line_width=1.0,
-                cross=True,
-            )
-            p.setPen(QPen(_TECH_VIS_LINE, 1.0))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(tech_rect)
-            # Бейдж техотступа как в схеме раскроя: красная скругленная рамка с числом.
-            badge_w = max(18.0, tech_rect.width() + 6.0)
-            badge_h = 12.0
-            badge_x = tech_rect.center().x() - (badge_w / 2.0)
-            badge_y = yt - 16.0
-            p.setPen(QPen(_TECH_VIS_LINE, 1.0))
-            p.setBrush(QColor(255, 247, 237))
-            p.drawRoundedRect(QRectF(badge_x, badge_y, badge_w, badge_h), 3, 3)
-            p.setPen(_TECH_VIS_LINE.darker(120))
-            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
-            p.drawText(
-                QRectF(badge_x, badge_y, badge_w, badge_h),
-                int(Qt.AlignCenter),
-                str(int(tech_mm)),
-            )
-
-            _paint_diagonal_hatch(
-                p,
-                QPolygonF(kerf_l),
-                fill=_KERF_VIS_FILL,
-                line_color=_KERF_VIS_LINE,
-                spacing=max(3.0, kw / 2.0),
-                line_width=1.0,
-                cross=True,
-            )
-            p.setPen(QPen(_KERF_VIS_LINE, 1.0))
-            p.drawRect(kerf_l)
-            p.drawLine(QPointF(kerf_l.left(), yb), QPointF(kerf_l.left(), yt))
-            p.drawLine(QPointF(kerf_l.right(), yb), QPointF(kerf_l.right(), yt))
-            p.setPen(_KERF_VIS_LINE.darker(120))
-            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
-            p.drawText(kerf_l.adjusted(0, 0, 0, 0), int(Qt.AlignCenter), str(int(kerf_mm)))
-
-            _paint_diagonal_hatch(
-                p,
-                QPolygonF(kerf_r),
-                fill=_KERF_VIS_FILL,
-                line_color=_KERF_VIS_LINE,
-                spacing=max(3.0, kw / 2.0),
-                line_width=1.0,
-                cross=True,
-            )
-            p.setPen(QPen(_KERF_VIS_LINE, 1.0))
-            p.drawRect(kerf_r)
-            p.drawLine(QPointF(kerf_r.left(), yb), QPointF(kerf_r.left(), yt))
-            p.drawLine(QPointF(kerf_r.right(), yb), QPointF(kerf_r.right(), yt))
-            p.setPen(_KERF_VIS_LINE.darker(120))
-            p.drawText(kerf_r, int(Qt.AlignCenter), str(int(kerf_mm)))
-
-            p.setPen(QPen(fill_color.darker(115), 1.0))
-            p.setBrush(fill_color)
-            p.drawRect(body)
-
-            p.setPen(QColor(15, 23, 42))
-            p.setFont(QFont("Segoe UI", 8))
-            p.drawText(
-                body.adjusted(4, 2, -4, -2),
-                int(Qt.AlignCenter | Qt.TextWordWrap),
-                title,
-            )
-
-            # Углы внутри рисунка: слева/справа внизу, как в схеме раскроя.
-            p.setPen(QColor(51, 65, 85))
-            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
-            angle_y = body.bottom() - 11.0
-            left_box = QRectF(body.left() + 1.5, angle_y, max(body.width() * 0.48 - 3.0, 12.0), 9.0)
-            right_box = QRectF(body.left() + body.width() * 0.52, angle_y, max(body.width() * 0.48 - 3.0, 12.0), 9.0)
-            p.drawText(
-                left_box,
-                int(Qt.AlignLeft | Qt.AlignVCenter),
-                f"L{left_angle_deg}°",
-            )
-            p.drawText(
-                right_box,
-                int(Qt.AlignRight | Qt.AlignVCenter),
-                f"R{right_angle_deg}°",
-            )
-
-        joint_no = 0
-        detail_no = 0
-        for r in self._rows:
-            kind = str(r.get("kind", "joint"))
-            if kind == "scrap":
-                length_mm = int(r.get("length_mm", 0))
-                scrap_no = int(r.get("scrap_no", 0))
-                max_len = max(int(r.get("max_length_mm", length_mm)), 1)
-                block = QRectF(8, y, self.width() - 16, row_h)
-                p.setPen(QPen(QColor(203, 213, 225), 1.0))
-                p.setBrush(QColor(255, 255, 255))
-                p.drawRoundedRect(block, 6, 6)
-                caption_rect = QRectF(block.left() + 4, y + 4, caption_w, block.height() - 8)
-                p.setPen(QPen(QColor(203, 213, 225), 1.0))
-                p.setBrush(QColor(248, 250, 252))
-                p.drawRoundedRect(caption_rect, 4, 4)
-                p.setPen(QColor(30, 41, 59))
-                p.setFont(QFont("Segoe UI", 8, QFont.Bold))
-                p.drawText(
-                    caption_rect.adjusted(8, 6, -8, -6),
-                    int(Qt.AlignLeft | Qt.AlignTop),
-                    f"Остаток №{scrap_no}",
-                )
-                p.setFont(QFont("Segoe UI", 8))
-                p.setPen(QColor(71, 85, 105))
-                p.drawText(
-                    caption_rect.adjusted(8, 22, -8, -6),
-                    int(Qt.AlignLeft | Qt.AlignTop),
-                    "кусок на складе",
-                )
-                drawing_rect = QRectF(
-                    caption_rect.right() + 6,
-                    block.top() + 4,
-                    block.right() - (caption_rect.right() + 10),
-                    block.height() - 8,
-                )
-                p.setPen(QPen(QColor(226, 232, 240), 1.0))
-                p.setBrush(QColor(255, 255, 255))
-                p.drawRoundedRect(drawing_rect, 4, 4)
-                frac = min(1.0, float(length_mm) / float(max_len))
-                bar_w = max(8.0, (drawing_rect.width() - 16.0) * frac)
-                bar_h = 26.0
-                bar_y = drawing_rect.center().y() - bar_h / 2.0
-                bar_rect = QRectF(drawing_rect.left() + 8.0, bar_y, bar_w, bar_h)
-                p.setPen(QPen(QColor(148, 163, 184), 1.0))
-                p.setBrush(QColor(226, 232, 240))
-                p.drawRoundedRect(bar_rect, 3.0, 3.0)
-                p.setPen(QColor(30, 41, 59))
-                p.setFont(QFont("Segoe UI", 9, QFont.Bold))
-                p.drawText(
-                    drawing_rect.adjusted(10, 0, -10, 0),
-                    int(Qt.AlignCenter),
-                    f"{length_mm} мм",
-                )
-                y += row_h + 10.0
-                continue
-            opening = int(r.get("opening", 0))
-            left_title = str(r.get("left_title", ""))
-            right_title = str(r.get("right_title", ""))
-            left_profile = str(r.get("left_profile_name", ""))
-            right_profile = str(r.get("right_profile_name", ""))
-            left_angle = int(r.get("left_right_angle", 90))
-            right_angle = int(r.get("right_left_angle", 90))
-            left_left_angle = int(r.get("left_left_angle", left_angle))
-            right_right_angle = int(r.get("right_right_angle", right_angle))
-
-            block = QRectF(8, y, self.width() - 16, row_h)
-            p.setPen(QPen(QColor(203, 213, 225), 1.0))
-            p.setBrush(QColor(255, 255, 255))
-            p.drawRoundedRect(block, 6, 6)
-            # Отдельный левый блок подписи.
-            caption_rect = QRectF(block.left() + 4, y + 4, caption_w, block.height() - 8)
-            p.setPen(QPen(QColor(203, 213, 225), 1.0))
-            p.setBrush(QColor(248, 250, 252))
-            p.drawRoundedRect(caption_rect, 4, 4)
-            p.setPen(QColor(30, 41, 59))
-            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
-            profile_caption = left_profile if left_profile == right_profile else f"{left_profile}/{right_profile}"
-            if kind == "detail":
-                detail_no += 1
-                row_caption = f"Пруток {opening}, {profile_caption}: деталь #{detail_no}"
-            else:
-                joint_no += 1
-                row_caption = f"Пруток {opening}, {profile_caption}: стык #{joint_no}"
-            p.drawText(
-                caption_rect.adjusted(8, 4, -8, -4),
-                int(Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap),
-                row_caption,
-            )
-
-            # Правый блок с рисунком (в той же строке).
-            drawing_rect = QRectF(
-                caption_rect.right() + 6,
-                block.top() + 4,
-                block.right() - (caption_rect.right() + 10),
-                block.height() - 8,
-            )
-            p.setPen(QPen(QColor(226, 232, 240), 1.0))
-            p.setBrush(QColor(255, 255, 255))
-            p.drawRoundedRect(drawing_rect, 4, 4)
-
-            local_detail_w = max(170.0, (drawing_rect.width() - 16.0) / 2.0)
-            ly = drawing_rect.top() + max(4.0, (drawing_rect.height() - detail_h) / 2.0)
-            if kind == "detail":
-                left_rect = QRectF(
-                    drawing_rect.left() + (drawing_rect.width() - local_detail_w) / 2.0,
-                    ly,
-                    local_detail_w,
-                    detail_h,
-                )
-                seam_x = left_rect.right()
-                right_rect = QRectF(0, 0, 0, 0)
-            else:
-                left_rect = QRectF(drawing_rect.left() + 4.0, ly, local_detail_w, detail_h)
-                seam_x = left_rect.right()
-                right_rect = QRectF(seam_x, ly, local_detail_w, detail_h)
-            left_tech = int(r.get("left_tech_mm", 30))
-            right_tech = int(r.get("right_tech_mm", 30))
-            kerf_mm = int(r.get("kerf_mm", 4))
-
-            lc = self._color_map.get(left_profile, QColor(147, 197, 253))
-            rc = self._color_map.get(right_profile, QColor(134, 239, 172))
-            left_detail_no = detail_no
-            if kind != "detail":
-                left_detail_no += 1
-            _draw_detail(left_rect, lc, left_title, left_left_angle, left_angle, left_tech, kerf_mm)
-            if kind != "detail":
-                right_detail_no = left_detail_no + 1
-                _draw_detail(
-                    right_rect,
-                    rc,
-                    right_title,
-                    right_angle,
-                    right_right_angle,
-                    right_tech,
-                    kerf_mm,
-                )
-                detail_no = right_detail_no
-                p.setPen(QPen(QColor(15, 23, 42), 1.2, Qt.PenStyle.DashLine))
-                p.drawLine(QPointF(seam_x, ly - 3), QPointF(seam_x, ly + detail_h + 3))
-            y += row_h + 10.0
-
-
 class ProfileLibraryDialog(QDialog):
     def __init__(self, parent: QWidget, rows: list[tuple[str, float]]) -> None:
         super().__init__(parent)
@@ -1110,7 +808,11 @@ class MainWindow(QMainWindow):
         self._project_name: str = ""
         self._project_cipher: str = ""
         self._layout_rows: list[dict[str, object]] = []
-        self._album_rows: list[dict[str, object]] = []
+        self._remnant_rows: list[dict[str, object]] = []
+        self._last_scrap_pieces: list[StockScrapPiece] = []
+        self._shop_floor_progress: dict[int, BarProgressRow] = {}
+        self._shop_floor_file: str = ""
+        self._shop_populating = False
         self._table_zoom = 1.0
         self._layout_zoom = 1.0
         self.log_emitter = LogEmitter()
@@ -1481,63 +1183,87 @@ class MainWindow(QMainWindow):
         layout_tab_l.addWidget(self.layout_overflow_table)
         self.right_tabs.addTab(layout_tab, "Схема раскроя")
 
-        album_tab = QWidget()
-        album_l = QVBoxLayout(album_tab)
-        album_l.setContentsMargins(4, 4, 4, 4)
-        album_l.setSpacing(6)
-        album_btns = QHBoxLayout()
-        album_l.addLayout(album_btns)
-        album_btns.addWidget(QLabel("Режим:"))
-        self.album_mode_combo = QComboBox()
-        self.album_mode_combo.addItem("Стыки", "joints")
-        self.album_mode_combo.addItem("Детали", "details")
-        self.album_mode_combo.addItem("Остатки ≥100 мм", "scraps")
-        self.album_mode_combo.setToolTip(
-            "Стыки: соседние детали в месте стыка.\n"
-            "Детали: контрольная карточка каждой отдельной детали с ее углами, техотступом и пропилом.\n"
-            "Остатки: куски на складе после раскроя не короче 100 мм (по убыванию длины)."
+        remnants_tab = QWidget()
+        remnants_l = QVBoxLayout(remnants_tab)
+        remnants_l.setContentsMargins(4, 4, 4, 4)
+        remnants_l.setSpacing(6)
+        remnants_sort_row = QHBoxLayout()
+        remnants_sort_row.addWidget(QLabel("Сортировка остатков:"))
+        self.remnants_sort_combo = QComboBox()
+        for mode_id, label in REMNANT_SORT_MODES:
+            self.remnants_sort_combo.addItem(label, mode_id)
+        self.remnants_sort_combo.setMinimumWidth(280)
+        self.remnants_sort_combo.currentIndexChanged.connect(self._apply_remnants_sort)
+        remnants_sort_row.addWidget(self.remnants_sort_combo, stretch=1)
+        remnants_l.addLayout(remnants_sort_row)
+        remnants_hint = QLabel(
+            f"Деловые остатки ≥{MIN_USABLE_REMNANT_MM} мм: цветная полоса (как на схеме раскроя), "
+            "справа — тип профиля и длина. Колонна отсортирована по выбранному режиму."
         )
-        album_btns.addWidget(self.album_mode_combo)
-        self.btn_album_pdf = QPushButton("Экспорт альбома PDF…")
-        self.btn_album_pdf.setEnabled(False)
-        self.btn_album_pdf.clicked.connect(
-            lambda _=False: self._run_with_loader("Экспорт альбома PDF...", self._export_album_pdf)
+        remnants_hint.setStyleSheet("color: #475569;")
+        remnants_hint.setWordWrap(True)
+        remnants_l.addWidget(remnants_hint)
+        self.remnants_widget = UsableRemnantsWidget()
+        self.remnants_scroll = QScrollArea()
+        self.remnants_scroll.setWidgetResizable(False)
+        self.remnants_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.remnants_scroll.setWidget(self.remnants_widget)
+        remnants_l.addWidget(self.remnants_scroll, 1)
+        self.right_tabs.addTab(remnants_tab, "Деловые остатки")
+
+        shop_tab = QWidget()
+        shop_l = QVBoxLayout(shop_tab)
+        shop_l.setContentsMargins(4, 4, 4, 4)
+        shop_l.setSpacing(6)
+        shop_btns = QHBoxLayout()
+        shop_l.addLayout(shop_btns)
+        self.btn_shop_open = QPushButton("Открыть JSON…")
+        self.btn_shop_open.clicked.connect(self._shop_floor_open_json)
+        shop_btns.addWidget(self.btn_shop_open)
+        self.btn_shop_save = QPushButton("Сохранить как JSON…")
+        self.btn_shop_save.setEnabled(False)
+        self.btn_shop_save.clicked.connect(self._shop_floor_save_json)
+        shop_btns.addWidget(self.btn_shop_save)
+        shop_btns.addStretch(1)
+        self.shop_progress_label = QLabel("Готово: —")
+        self.shop_progress_label.setStyleSheet("color: #1e293b; font-weight: 600;")
+        shop_btns.addWidget(self.shop_progress_label)
+        shop_hint = QLabel(
+            "По строке прутка: клик — время начала реза; «Готово» — завершение и время окончания. "
+            "Двойной клик по «Конец» — вручную задать окончание. Прогресс сохраняется в JSON."
         )
-        album_btns.addWidget(self.btn_album_pdf)
-        album_btns.addStretch(1)
-        album_sort_row = QHBoxLayout()
-        self.album_sort_label = QLabel("Сортировка стыков / деталей:")
-        self.album_sort_combo = QComboBox()
-        for mode_id, label in SORT_MODES:
-            self.album_sort_combo.addItem(label, mode_id)
-        self.album_sort_combo.setMinimumWidth(260)
-        self.album_sort_combo.currentIndexChanged.connect(self._apply_album_sort)
-        self.scrap_sort_label = QLabel("Сортировка остатков:")
-        self.scrap_sort_combo = QComboBox()
-        for mode_id, label in SCRAP_SORT_MODES:
-            self.scrap_sort_combo.addItem(label, mode_id)
-        self.scrap_sort_combo.setMinimumWidth(240)
-        self.scrap_sort_combo.currentIndexChanged.connect(self._apply_album_sort)
-        album_sort_row.addWidget(self.album_sort_label)
-        album_sort_row.addWidget(self.album_sort_combo, stretch=1)
-        album_sort_row.addWidget(self.scrap_sort_label)
-        album_sort_row.addWidget(self.scrap_sort_combo, stretch=1)
-        album_l.addLayout(album_sort_row)
-        self.album_mode_combo.currentIndexChanged.connect(self._on_album_mode_changed)
-        self._sync_album_sort_controls()
-        album_hint = QLabel(
-            "Стыки и детали — своя сортировка списка; остатки — куски ≥100 мм после проекта, отдельная сортировка длин."
+        shop_hint.setStyleSheet("color: #475569;")
+        shop_hint.setWordWrap(True)
+        shop_l.addWidget(shop_hint)
+        self.shop_floor_table = QTableWidget()
+        self.shop_floor_table.setColumnCount(9)
+        self.shop_floor_table.setHorizontalHeaderLabels(
+            [
+                "Готово",
+                "Пруток №",
+                "Профиль",
+                "Заготовка, мм",
+                "Остаток, мм",
+                "Начало",
+                "Конец",
+                "Мин",
+                "Примечание",
+            ]
         )
-        album_hint.setStyleSheet("color: #475569;")
-        album_l.addWidget(album_hint)
-        self.album_widget = JointAlbumWidget()
-        self.album_scroll = QScrollArea()
-        # False: иначе высота альбома сжимается до окна и видна только одна строка.
-        self.album_scroll.setWidgetResizable(False)
-        self.album_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.album_scroll.setWidget(self.album_widget)
-        album_l.addWidget(self.album_scroll, 1)
-        self.right_tabs.addTab(album_tab, "Альбом стыков")
+        self.shop_floor_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.shop_floor_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.shop_floor_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+        )
+        self.shop_floor_table.setAlternatingRowColors(False)
+        sh = self.shop_floor_table.horizontalHeader()
+        sh.setStretchLastSection(True)
+        for i in range(self.shop_floor_table.columnCount()):
+            sh.setSectionResizeMode(i, QHeaderView.Interactive)
+        self.shop_floor_table.cellClicked.connect(self._shop_floor_cell_clicked)
+        self.shop_floor_table.cellChanged.connect(self._shop_floor_cell_changed)
+        shop_l.addWidget(self.shop_floor_table, 1)
+        self.right_tabs.addTab(shop_tab, "Операционная выработка")
         self._copy_shortcut = QShortcut(QKeySequence.Copy, self)
         self._copy_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._copy_shortcut.activated.connect(self._copy_from_focused_widget)
@@ -2006,10 +1732,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         """
         Единая точка обновления всех представлений после любого расчёта.
-        Обновляет раскрой, схему, альбом и массовые метрики синхронно.
+        Обновляет раскрой, схему, остатки, выработку и массовые метрики синхронно.
         """
         self._optimizer_cuts = list(result.cuts)
         self._last_final_scraps_mm = list(result.final_scraps_mm)
+        self._last_scrap_pieces = list(result.final_scrap_pieces)
         self._last_kerf_mm = kerf_mm
         self._last_offset_90_mm = offset_90_mm
         self._last_offset_other_mm = offset_other_mm
@@ -2017,7 +1744,7 @@ class MainWindow(QMainWindow):
         self.btn_pdf.setEnabled(True)
         self.btn_layout_xlsx.setEnabled(True)
         self.btn_layout_pdf.setEnabled(True)
-        self.btn_album_pdf.setEnabled(True)
+        self.btn_shop_save.setEnabled(True)
         self._apply_chart_metrics(chart_metrics)
         self._refresh_all_result_views()
 
@@ -2042,30 +1769,6 @@ class MainWindow(QMainWindow):
                 it = QTableWidgetItem(v)
                 it.setBackground(bg)
                 self.layout_overflow_table.setItem(row, c, it)
-
-    def _on_album_mode_changed(self) -> None:
-        self._sync_album_sort_controls()
-        self._refresh_album()
-
-    def _sync_album_sort_controls(self) -> None:
-        if not hasattr(self, "album_mode_combo"):
-            return
-        scraps = self.album_mode_combo.currentData() == "scraps"
-        self.album_sort_label.setVisible(not scraps)
-        self.album_sort_combo.setVisible(not scraps)
-        self.scrap_sort_label.setVisible(scraps)
-        self.scrap_sort_combo.setVisible(scraps)
-
-    def _refresh_album(self) -> None:
-        mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
-        if mode == "scraps":
-            self._update_album_plan([])
-            return
-        if not self._optimizer_cuts:
-            self.album_widget.clear_rows()
-            self._album_rows = []
-            return
-        self._update_album_plan(self._sorted_display_cuts_album())
 
     def _browse_scrap(self) -> None:
         base = self.scrap_path_edit.text().strip()
@@ -2618,263 +2321,6 @@ class MainWindow(QMainWindow):
         c.save()
         QMessageBox.information(self, "Экспорт схемы", f"Сохранено:\n{p}")
 
-    def _export_album_pdf(self) -> None:
-        if not self._album_rows:
-            am = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
-            msg = (
-                "Нет остатков не короче 100 мм после последнего расчёта."
-                if am == "scraps"
-                else "Сначала выполните расчёт."
-            )
-            QMessageBox.information(self, "Экспорт альбома", msg)
-            return
-        default = Path(self.path_edit.text() or "layout").with_name("raskroy_album_a4.pdf")
-        p, _ = QFileDialog.getSaveFileName(self, "Сохранить PDF-альбом", str(default), "PDF (*.pdf)")
-        if not p:
-            return
-        try:
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib.units import mm
-            from reportlab.pdfgen import canvas
-        except ImportError as e:  # pragma: no cover
-            QMessageBox.critical(self, "Экспорт альбома", f"Нужен reportlab: {e}")
-            return
-        font_regular, font_bold = reportlab_cyrillic_fonts(logger)
-        c = canvas.Canvas(str(Path(p)), pagesize=A4)
-        pw, ph = A4
-        amode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
-        if amode == "scraps":
-            album_title = "Альбом остатков ≥100 мм (A4, вертикально)"
-        elif amode == "details":
-            album_title = "Альбом деталей (A4, вертикально)"
-        else:
-            album_title = "Альбом стыков (A4, вертикально)"
-
-        def _draw_pdf_header() -> float:
-            y0 = ph - 12 * mm
-            if _LOGO_PATH.is_file():
-                c.drawImage(str(_LOGO_PATH), 12 * mm, y0 - 7.5 * mm, width=30 * mm, height=5 * mm, mask="auto")
-                c.setFillColor(colors.HexColor("#105799"))
-                c.setFont(font_bold, 9)
-                c.drawString(12 * mm, y0 - 10.8 * mm, "РАСКРОЙ")
-            c.setFillColor(colors.black)
-            header_x = 50 * mm
-            c.setFont(font_bold, 11)
-            c.drawString(header_x, y0, album_title)
-            c.setFont(font_regular, 8)
-            c.drawString(header_x, y0 - 4 * mm, f"Проект: {self._project_name or '—'}")
-            c.drawString(header_x, y0 - 8 * mm, f"Шифр: {self._project_cipher or '—'}")
-            # Такой же увеличенный отступ после шапки, как в PDF схемы раскроя.
-            return y0 - 40 * mm
-
-        y = _draw_pdf_header()
-        # Сверхкомпактная верстка: высота блоков уменьшена примерно в 2 раза.
-        detail_h = 7 * mm
-        row_h = 10.5 * mm
-        caption_w = 48 * mm
-        joint_no = 0
-        detail_no = 0
-        for r in self._album_rows:
-            if y < 20 * mm:
-                c.showPage()
-                y = _draw_pdf_header()
-            kind = str(r.get("kind", "joint"))
-            if kind == "scrap":
-                length_mm = int(r.get("length_mm", 0))
-                scrap_no = int(r.get("scrap_no", 0))
-                row_top = y
-                row_left = 11.5 * mm
-                row_w = pw - 23.0 * mm
-                c.setStrokeColor(colors.HexColor("#cbd5e1"))
-                c.setFillColor(colors.HexColor("#f1f5f9"))
-                c.setLineWidth(0.6)
-                c.roundRect(row_left, row_top - row_h, row_w, row_h, 2.0 * mm, stroke=1, fill=1)
-                c.setFillColor(colors.black)
-                c.setFont(font_bold, 8)
-                c.drawString(
-                    row_left + 2 * mm,
-                    row_top - (row_h / 2.0) + 1 * mm,
-                    f"Остаток №{scrap_no}: {length_mm} мм",
-                )
-                y = row_top - row_h - 1.2 * mm
-                continue
-            opening = int(r.get("opening", 0))
-            left_title = str(r.get("left_title", ""))
-            right_title = str(r.get("right_title", ""))
-            left_angle = int(r.get("left_right_angle", 90))
-            right_angle = int(r.get("right_left_angle", 90))
-            left_left_angle = int(r.get("left_left_angle", left_angle))
-            right_right_angle = int(r.get("right_right_angle", right_angle))
-            left_tech = int(r.get("left_tech_mm", 30))
-            right_tech = int(r.get("right_tech_mm", 30))
-            kerf_mm = int(r.get("kerf_mm", 4))
-            c.setFont(font_bold, 8)
-            c.setFillColor(colors.black)
-            if kind == "detail":
-                detail_no += 1
-                row_caption = f"Пруток {opening}: деталь №{detail_no}"
-            else:
-                joint_no += 1
-                row_caption = f"Пруток {opening}: стык №{joint_no}"
-            row_top = y
-            row_left = 11.5 * mm
-            row_w = pw - 23.0 * mm
-            # Левый блок подписи (в одной строке с рисунком).
-            c.setStrokeColor(colors.HexColor("#cbd5e1"))
-            c.setFillColor(colors.HexColor("#f8fafc"))
-            c.setLineWidth(0.6)
-            c.roundRect(row_left, row_top - row_h, caption_w, row_h, 2.0 * mm, stroke=1, fill=1)
-            c.setFillColor(colors.black)
-            c.setFont(font_bold, 5.5)
-            c.drawString(row_left + 1.2 * mm, row_top - (row_h / 2.0) + 0.35 * mm, row_caption)
-            # Правый блок рисунка.
-            drawing_x = row_left + caption_w + 1.8 * mm
-            drawing_w = row_w - caption_w - 1.8 * mm
-            c.setStrokeColor(colors.HexColor("#cbd5e1"))
-            c.setFillColor(colors.white)
-            c.roundRect(drawing_x, row_top - row_h, drawing_w, row_h, 2.0 * mm, stroke=1, fill=1)
-            local_detail_w = max(36 * mm, (drawing_w - 3 * mm) / 2.0)
-            ly = row_top - row_h + (row_h - detail_h) / 2.0
-            if kind == "detail":
-                left_card_x = drawing_x + (drawing_w - local_detail_w) / 2.0
-                seam_x = left_card_x + local_detail_w
-            else:
-                left_card_x = drawing_x + 1.0 * mm
-                seam_x = left_card_x + local_detail_w
-            ltw = 4 * mm if left_tech == 50 else 2.5 * mm
-            rtw = 4 * mm if right_tech == 50 else 2.5 * mm
-            kw = 1.8 * mm if kerf_mm >= 4 else 1.2 * mm
-            yb = ly + detail_h
-            yt = ly
-
-            def _two_line_title(text: str, width_mm: float) -> tuple[str, str]:
-                raw = (text or "").strip()
-                if not raw:
-                    return "", ""
-                words = raw.split()
-                if not words:
-                    return raw[:30], ""
-                max_w = float(width_mm) - 4.0 * mm
-                l1 = ""
-                l2 = ""
-                for wtxt in words:
-                    cand = (l1 + " " + wtxt).strip()
-                    if c.stringWidth(cand, font_regular, 7) <= max_w or not l1:
-                        l1 = cand
-                        continue
-                    cand2 = (l2 + " " + wtxt).strip()
-                    if c.stringWidth(cand2, font_regular, 7) <= max_w or not l2:
-                        l2 = cand2
-                    else:
-                        l2 = (cand2[:24] + "…") if len(cand2) > 24 else cand2
-                        break
-                return l1, l2
-
-            def _pdf_strip_card(
-                x0: float,
-                tech_w: float,
-                tech_mm_val: int,
-                title: str,
-                base_fill: colors.Color,
-            ) -> None:
-                ze = x0 + local_detail_w - kw
-                c.setStrokeColor(colors.HexColor("#e2e8f0"))
-                c.setFillColor(base_fill)
-                c.rect(x0, ly, local_detail_w, detail_h, stroke=1, fill=1)
-                c.setFillColor(colors.HexColor("#ffedd5"))
-                c.setStrokeColor(colors.HexColor("#ea580c"))
-                c.setLineWidth(0.3)
-                c.rect(x0, ly, tech_w, detail_h, stroke=1, fill=1)
-                # Бейдж техотступа как в схеме раскроя (скругленный, только число).
-                badge_w = max(4.0 * mm, tech_w + 1.2 * mm)
-                badge_h = 2.4 * mm
-                bx = x0 + (tech_w - badge_w) / 2.0
-                by = yt + detail_h + 1.1 * mm
-                c.setFillColor(colors.HexColor("#fff7ed"))
-                c.setStrokeColor(colors.HexColor("#ea580c"))
-                c.setLineWidth(0.25)
-                c.roundRect(bx, by, badge_w, badge_h, 0.6 * mm, stroke=1, fill=1)
-                c.setFillColor(colors.HexColor("#9a3412"))
-                c.setFont(font_bold, 3.2)
-                c.drawCentredString(bx + badge_w / 2.0, by + 0.62 * mm, str(int(tech_mm_val)))
-                kx0 = x0 + tech_w
-                c.setFillColor(colors.HexColor("#cffafe"))
-                c.setStrokeColor(colors.HexColor("#0e7490"))
-                c.rect(kx0, ly, kw, detail_h, stroke=1, fill=1)
-                c.setLineWidth(0.35)
-                c.line(kx0, yt, kx0, yb)
-                c.line(kx0 + kw, yt, kx0 + kw, yb)
-                c.setFillColor(colors.HexColor("#155e75"))
-                c.setFont(font_regular, 4.6)
-                c.drawCentredString(kx0 + kw / 2.0, ly + detail_h / 2.0 - 0.6, str(kerf_mm))
-                body_x = x0 + tech_w + kw
-                body_w = ze - body_x
-                c.setFillColor(base_fill)
-                c.setStrokeColor(base_fill)
-                c.rect(body_x, ly, body_w, detail_h, stroke=0, fill=1)
-                c.setStrokeColor(colors.HexColor("#0e7490"))
-                c.setFillColor(colors.HexColor("#cffafe"))
-                c.rect(ze, ly, kw, detail_h, stroke=1, fill=1)
-                c.line(ze, yt, ze, yb)
-                c.line(ze + kw, yt, ze + kw, yb)
-                c.setFillColor(colors.HexColor("#155e75"))
-                c.drawCentredString(ze + kw / 2.0, ly + detail_h / 2.0 - 1.0, str(kerf_mm))
-                c.setFillColor(colors.black)
-                c.setFont(font_regular, 4.8)
-                t1, t2 = _two_line_title(title, body_w)
-                if t2:
-                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 + 0.55 * mm, t1)
-                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 0.7 * mm, t2)
-                else:
-                    c.drawCentredString(body_x + body_w / 2.0, ly + detail_h / 2.0 - 0.2 * mm, t1)
-
-            def _draw_pdf_angles_in_body(
-                x0: float,
-                tech_w: float,
-                left_deg: int,
-                right_deg: int,
-            ) -> None:
-                body_x = x0 + tech_w + kw
-                body_w = max(8 * mm, local_detail_w - tech_w - 2 * kw)
-                ay = ly + 0.9 * mm
-                c.setFillColor(colors.HexColor("#334155"))
-                c.setFont(font_bold, 4.8)
-                c.drawString(body_x + 0.5 * mm, ay, f"L{left_deg}°")
-                c.drawRightString(body_x + body_w - 0.5 * mm, ay, f"R{right_deg}°")
-
-            left_detail_no = detail_no
-            if kind != "detail":
-                left_detail_no += 1
-            _pdf_strip_card(
-                left_card_x,
-                ltw,
-                left_tech,
-                left_title,
-                colors.HexColor("#dbeafe"),
-            )
-            if kind != "detail":
-                right_detail_no = left_detail_no + 1
-                _pdf_strip_card(
-                    seam_x,
-                    rtw,
-                    right_tech,
-                    right_title,
-                    colors.HexColor("#dcfce7"),
-                )
-                detail_no = right_detail_no
-                c.setStrokeColor(colors.HexColor("#0f172a"))
-                c.setLineWidth(0.8)
-                c.setDash(2, 2)
-                c.line(seam_x, ly - 1.0 * mm, seam_x, ly + detail_h + 1.0 * mm)
-                c.setDash()
-            _draw_pdf_angles_in_body(left_card_x, ltw, left_left_angle, left_angle)
-            if kind != "detail":
-                _draw_pdf_angles_in_body(seam_x, rtw, right_angle, right_right_angle)
-            y = row_top - row_h - 1.2 * mm
-        c.save()
-        QMessageBox.information(self, "Экспорт альбома", f"Сохранено:\n{p}")
-
     def _compute(self) -> None:
         logger.info("Compute requested")
         path = self.path_edit.text().strip()
@@ -2931,18 +2377,20 @@ class MainWindow(QMainWindow):
                 self._last_sorted_cuts = None
                 self._optimizer_cuts = None
                 self._last_final_scraps_mm = []
+                self._last_scrap_pieces = []
                 self._last_summary_text = ""
                 self.btn_xlsx.setEnabled(False)
                 self.btn_pdf.setEnabled(False)
                 self.btn_layout_xlsx.setEnabled(False)
                 self.btn_layout_pdf.setEnabled(False)
-                self.btn_album_pdf.setEnabled(False)
+                self.btn_shop_save.setEnabled(False)
                 self.mass_chart.clear_data()
                 self.waste_chart.clear_data()
                 self.layout_widget.clear_plan()
                 self._layout_rows = []
-                self.album_widget.clear_rows()
-                self._album_rows = []
+                self.remnants_widget.clear_rows()
+                self._remnant_rows = []
+                self.shop_floor_table.setRowCount(0)
                 return
             demands = spec_rows_to_demands(rows)
             bars, bars_err = self._selected_bar_lengths(
@@ -3029,11 +2477,6 @@ class MainWindow(QMainWindow):
             return []
         return sort_cuts(self._optimizer_cuts, self._sort_mode_from_combo(self.layout_sort_combo))
 
-    def _sorted_display_cuts_album(self) -> list[CutEvent]:
-        if not self._optimizer_cuts:
-            return []
-        return sort_cuts(self._optimizer_cuts, self._sort_mode_from_combo(self.album_sort_combo))
-
     def _apply_table_sort(self) -> None:
         if not self._optimizer_cuts:
             self._last_sorted_cuts = None
@@ -3047,6 +2490,8 @@ class MainWindow(QMainWindow):
         if not self._optimizer_cuts:
             self._layout_rows = []
             self.layout_widget.clear_plan()
+            self._update_remnants_display()
+            self._populate_shop_floor_table()
             return
         cuts = self._sorted_display_cuts_layout()
         self._update_layout_plan(
@@ -3056,8 +2501,8 @@ class MainWindow(QMainWindow):
             offset_other_mm=self._last_offset_other_mm,
         )
 
-    def _apply_album_sort(self) -> None:
-        self._refresh_album()
+    def _apply_remnants_sort(self) -> None:
+        self._update_remnants_display()
 
     def _refresh_all_result_views(self) -> None:
         if not self._optimizer_cuts:
@@ -3065,12 +2510,12 @@ class MainWindow(QMainWindow):
             self.table.setRowCount(0)
             self._layout_rows = []
             self.layout_widget.clear_plan()
-            self.album_widget.clear_rows()
-            self._album_rows = []
+            self.remnants_widget.clear_rows()
+            self._remnant_rows = []
+            self.shop_floor_table.setRowCount(0)
             return
         self._apply_table_sort()
         self._apply_layout_sort()
-        self._refresh_album()
 
     def _populate_table(self, cuts: list[CutEvent]) -> None:
         logger.info("populate_table start: cuts=%d", len(cuts))
@@ -3513,41 +2958,311 @@ class MainWindow(QMainWindow):
         if not plan.rows:
             self._layout_rows = []
             self.layout_widget.clear_plan()
+            self._update_remnants_display()
+            self._populate_shop_floor_table()
             return
         color_map = self._profile_color_map(list(plan.profile_names))
         self._layout_rows = plan.rows
         self.layout_widget.set_plan(plan.rows, color_map)
+        self._update_remnants_display()
+        self._populate_shop_floor_table()
 
-    def _update_album_plan(self, cuts: list[CutEvent]) -> None:
-        mode = self.album_mode_combo.currentData() if hasattr(self, "album_mode_combo") else "joints"
-        if mode == "scraps":
-            sm = self.scrap_sort_combo.currentData() if hasattr(self, "scrap_sort_combo") else "length_desc"
-            if not isinstance(sm, str):
-                sm = "length_desc"
-            scrap_plan = build_scrap_album_rows(
-                self._last_final_scraps_mm or [],
-                min_length_mm=100,
-                sort_mode=sm,
+    def _remnants_sort_mode(self) -> str:
+        mode = self.remnants_sort_combo.currentData() if hasattr(self, "remnants_sort_combo") else "length_desc"
+        return mode if isinstance(mode, str) else "length_desc"
+
+    def _update_remnants_display(self) -> None:
+        if not self._layout_rows and not self._last_scrap_pieces:
+            self._remnant_rows = []
+            self.remnants_widget.clear_rows()
+            return
+        rows = build_usable_remnant_rows(
+            layout_rows=self._layout_rows,
+            cuts=self._optimizer_cuts or [],
+            scrap_pieces=self._last_scrap_pieces,
+            min_length_mm=MIN_USABLE_REMNANT_MM,
+            sort_mode=self._remnants_sort_mode(),
+        )
+        names = {str(r.get("profile_name", "")) for r in rows if r.get("profile_name")}
+        color_map = self._profile_color_map(sorted(names))
+        self._remnant_rows = rows
+        self.remnants_widget.set_rows(rows, color_map)
+
+    @staticmethod
+    def _layout_row_profile_codes(row: dict[str, object]) -> str:
+        segs = row.get("segments", [])
+        if not isinstance(segs, list):
+            return ""
+        codes: list[str] = []
+        for seg in segs:
+            if not isinstance(seg, dict) or str(seg.get("kind", "")) != "profile":
+                continue
+            code = str(seg.get("profile_code", "")).strip()
+            if code and code not in codes:
+                codes.append(code)
+        return ", ".join(codes)
+
+    def _populate_shop_floor_table(self) -> None:
+        self._shop_populating = True
+        try:
+            openings = sorted(int(r.get("opening", 0) or 0) for r in self._layout_rows)
+            merged = merge_progress(openings, self._shop_floor_progress)
+            self._shop_floor_progress = {r.opening: r for r in merged}
+            self.shop_floor_table.setRowCount(0)
+            row_by_opening: dict[int, int] = {}
+            for layout_row in sorted(self._layout_rows, key=lambda r: int(r.get("opening", 0) or 0)):
+                opening = int(layout_row.get("opening", 0) or 0)
+                if opening <= 0:
+                    continue
+                prog = self._shop_floor_progress[opening]
+                r = self.shop_floor_table.rowCount()
+                row_by_opening[opening] = r
+                self.shop_floor_table.insertRow(r)
+                self._fill_shop_floor_row(
+                    r,
+                    opening=opening,
+                    profile_txt=self._layout_row_profile_codes(layout_row),
+                    bar_len=int(layout_row.get("bar_len", 0) or 0),
+                    remainder=int(layout_row.get("remainder", 0) or 0),
+                    prog=prog,
+                )
+            self._update_shop_progress_label()
+        finally:
+            self._shop_populating = False
+
+    def _fill_shop_floor_row(
+        self,
+        row: int,
+        *,
+        opening: int,
+        profile_txt: str,
+        bar_len: int,
+        remainder: int,
+        prog: BarProgressRow,
+    ) -> None:
+        done_bg = QColor(226, 232, 240)
+        active_bg = QColor(255, 251, 235)
+        normal_bg = QColor(255, 255, 255)
+        bg = done_bg if prog.done else (active_bg if prog.start_iso and not prog.end_iso else normal_bg)
+
+        done_it = QTableWidgetItem()
+        done_it.setFlags(
+            Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        )
+        done_it.setCheckState(Qt.CheckState.Checked if prog.done else Qt.CheckState.Unchecked)
+        done_it.setBackground(bg)
+        self.shop_floor_table.setItem(row, 0, done_it)
+
+        read_only_cols = [
+            str(opening),
+            profile_txt,
+            str(bar_len),
+            str(remainder),
+            self._fmt_shop_time(prog.start_iso),
+            self._fmt_shop_time(prog.end_iso),
+            duration_minutes(prog.start_iso, prog.end_iso),
+        ]
+        for col, text in enumerate(read_only_cols, start=1):
+            it = QTableWidgetItem(text)
+            flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            if col in (5, 6):
+                flags |= Qt.ItemIsEditable
+            it.setFlags(flags)
+            it.setBackground(bg)
+            if prog.done:
+                it.setForeground(QColor(100, 116, 139))
+            self.shop_floor_table.setItem(row, col, it)
+
+        note_it = QTableWidgetItem(prog.note)
+        note_it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable)
+        note_it.setBackground(bg)
+        self.shop_floor_table.setItem(row, 8, note_it)
+
+    @staticmethod
+    def _fmt_shop_time(iso: str) -> str:
+        if not iso:
+            return ""
+        try:
+            return datetime.fromisoformat(iso).strftime("%d.%m %H:%M")
+        except ValueError:
+            return iso
+
+    def _shop_opening_at_row(self, row: int) -> int | None:
+        it = self.shop_floor_table.item(row, 1)
+        if it is None:
+            return None
+        try:
+            return int(it.text().strip())
+        except ValueError:
+            return None
+
+    def _refresh_shop_floor_row(self, row: int) -> None:
+        opening = self._shop_opening_at_row(row)
+        if opening is None or opening not in self._shop_floor_progress:
+            return
+        layout_row = next(
+            (r for r in self._layout_rows if int(r.get("opening", 0) or 0) == opening),
+            None,
+        )
+        if layout_row is None:
+            return
+        prog = self._shop_floor_progress[opening]
+        self._shop_populating = True
+        try:
+            self._fill_shop_floor_row(
+                row,
+                opening=opening,
+                profile_txt=self._layout_row_profile_codes(layout_row),
+                bar_len=int(layout_row.get("bar_len", 0) or 0),
+                remainder=int(layout_row.get("remainder", 0) or 0),
+                prog=prog,
             )
-            self._album_rows = scrap_plan.rows
-            self.album_widget.set_rows(scrap_plan.rows, {})
-            return
-        if not cuts:
-            self._album_rows = []
-            self.album_widget.clear_rows()
-            return
-        album_plan = build_album_plan_rows(
-            cuts,
-            mode=("details" if mode == "details" else "joints"),
-            offset_90_mm=self._last_offset_90_mm,
-            offset_other_mm=self._last_offset_other_mm,
-            kerf_mm=self._last_kerf_mm or 4,
+        finally:
+            self._shop_populating = False
+        self._update_shop_progress_label()
+
+    def _update_shop_progress_label(self) -> None:
+        total = self.shop_floor_table.rowCount()
+        done = sum(1 for r in self._shop_floor_progress.values() if r.done)
+        active = sum(
+            1
+            for r in self._shop_floor_progress.values()
+            if r.start_iso and not r.done
         )
-        self._album_rows = album_plan.rows
-        self.album_widget.set_rows(
-            album_plan.rows,
-            self._profile_color_map(list(album_plan.profile_names)),
+        if total <= 0:
+            self.shop_progress_label.setText("Готово: —")
+            return
+        self.shop_progress_label.setText(
+            f"Готово: {done} / {total}  |  в работе: {active}"
         )
+
+    def _shop_floor_cell_clicked(self, row: int, col: int) -> None:
+        if self._shop_populating or col == 0:
+            return
+        opening = self._shop_opening_at_row(row)
+        if opening is None:
+            return
+        prog = self._shop_floor_progress.setdefault(opening, BarProgressRow(opening=opening))
+        if prog.done:
+            return
+        if col == 6 and prog.start_iso and not prog.end_iso:
+            prog.end_iso = datetime.now().isoformat(timespec="seconds")
+            prog.done = True
+            self._refresh_shop_floor_row(row)
+            return
+        if not prog.start_iso:
+            prog.start_iso = datetime.now().isoformat(timespec="seconds")
+            self._refresh_shop_floor_row(row)
+
+    def _shop_floor_cell_changed(self, row: int, col: int) -> None:
+        if self._shop_populating:
+            return
+        opening = self._shop_opening_at_row(row)
+        if opening is None:
+            return
+        prog = self._shop_floor_progress.setdefault(opening, BarProgressRow(opening=opening))
+        if col == 0:
+            done_it = self.shop_floor_table.item(row, 0)
+            checked = (
+                done_it is not None
+                and done_it.checkState() == Qt.CheckState.Checked
+            )
+            prog.done = checked
+            if checked and not prog.end_iso:
+                if not prog.start_iso:
+                    prog.start_iso = datetime.now().isoformat(timespec="seconds")
+                prog.end_iso = datetime.now().isoformat(timespec="seconds")
+            if not checked:
+                prog.end_iso = ""
+            self._refresh_shop_floor_row(row)
+        elif col == 5:
+            it = self.shop_floor_table.item(row, 5)
+            prog.start_iso = self._parse_shop_time_input(it.text() if it else "")
+            self._refresh_shop_floor_row(row)
+        elif col == 6:
+            it = self.shop_floor_table.item(row, 6)
+            prog.end_iso = self._parse_shop_time_input(it.text() if it else "")
+            if prog.end_iso and prog.start_iso:
+                prog.done = True
+            self._refresh_shop_floor_row(row)
+        elif col == 8:
+            it = self.shop_floor_table.item(row, 8)
+            prog.note = it.text().strip() if it else ""
+
+    @staticmethod
+    def _parse_shop_time_input(text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        for fmt in ("%d.%m %H:%M", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(raw, fmt).isoformat(timespec="seconds")
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(raw).isoformat(timespec="seconds")
+        except ValueError:
+            return raw
+
+    def _shop_floor_open_json(self) -> None:
+        base = self._shop_floor_file or self.path_edit.text().strip()
+        p, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть прогресс выработки",
+            str(Path(base).parent) if base else "",
+            "JSON (*.json)",
+        )
+        if not p:
+            return
+        try:
+            session = load_session(p)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Открыть JSON", str(e))
+            return
+        stored = progress_by_opening(session.rows)
+        openings = sorted(int(r.get("opening", 0) or 0) for r in self._layout_rows)
+        if openings:
+            merged = merge_progress(openings, stored)
+            self._shop_floor_progress = {r.opening: r for r in merged}
+        else:
+            self._shop_floor_progress = stored
+        self._shop_floor_file = p
+        if self._layout_rows:
+            self._populate_shop_floor_table()
+        else:
+            self._update_shop_progress_label()
+        QMessageBox.information(self, "Открыть JSON", f"Загружено строк: {len(stored)}")
+
+    def _shop_floor_save_json(self) -> None:
+        if not self._shop_floor_progress:
+            QMessageBox.information(self, "Сохранить JSON", "Нет данных для сохранения.")
+            return
+        default = Path(self.path_edit.text() or "project").with_name("shop_floor_progress.json")
+        if self._shop_floor_file:
+            default = Path(self._shop_floor_file)
+        p, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить прогресс выработки",
+            str(default),
+            "JSON (*.json)",
+        )
+        if not p:
+            return
+        openings = sorted(int(r.get("opening", 0) or 0) for r in self._layout_rows)
+        rows = [self._shop_floor_progress[o] for o in openings if o in self._shop_floor_progress]
+        session = ShopFloorSession(
+            project_name=self._project_name,
+            project_cipher=self._project_cipher,
+            spec_path=self.path_edit.text().strip(),
+            rows=rows,
+        )
+        try:
+            save_session(p, session)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Сохранить JSON", str(e))
+            return
+        self._shop_floor_file = p
+        QMessageBox.information(self, "Сохранить JSON", f"Сохранено:\n{p}")
 
     def _ordered_profile_names(self, names: set[str]) -> list[str]:
         """Порядок подписей как в сводке массы: Н20…Н23, затем остальные по алфавиту."""

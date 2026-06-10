@@ -44,8 +44,18 @@ class CutEvent:
     stock_opening_id: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class StockScrapPiece:
+    """Кусок на складе обрезков после расчёта."""
+
+    length_mm: int
+    opening_id: int
+    profile_key: str
+
+
 @dataclass
 class OptimizationResult:
     cuts: list[CutEvent] = field(default_factory=list)
     final_scraps_mm: list[int] = field(default_factory=list)
+    final_scrap_pieces: list[StockScrapPiece] = field(default_factory=list)
     bars_used: dict[int, int] = field(default_factory=dict)  # length -> count

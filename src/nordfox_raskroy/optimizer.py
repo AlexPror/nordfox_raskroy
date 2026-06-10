@@ -4,7 +4,7 @@ from collections import Counter
 import logging
 from typing import Sequence
 
-from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, SpecRow
+from nordfox_raskroy.models import CutEvent, OptimizationResult, PartDemand, StockScrapPiece, SpecRow
 from nordfox_raskroy.profile_codes import profile_label_for_code
 from nordfox_raskroy.profile_dimensions import (
     extra_trailing_end_clearance_mm,
@@ -304,6 +304,10 @@ def optimize_cutting(
         )
 
     result.cuts.sort(key=lambda c: c.stock_opening_id)
+    result.final_scrap_pieces = [
+        StockScrapPiece(length_mm=int(length), opening_id=int(oid), profile_key=str(prof))
+        for length, oid, prof in scraps
+    ]
     result.final_scraps_mm = sorted(length for length, _oid, _prof in scraps)
     logger.info(
         "optimize_cutting done: cuts=%d new_bars=%d final_scraps=%d",
